@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Perlin Noise — Shadertoy Simulator</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/material-darker.min.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="app-header">
+    <h1>Perlin Noise <span class="subtitle">Shadertoy Simulator</span></h1>
+    <div class="header-actions">
+      <button id="btn-run" class="btn btn-primary" title="Compile & run (Cmd/Ctrl + Enter)">
+        &#9654; Run
+      </button>
+      <span class="hint desktop-only">Cmd/Ctrl + Enter to compile</span>
+    </div>
+  </header>
+
+  <nav class="mobile-nav" aria-label="Main views">
+    <button type="button" class="mobile-nav-btn is-active" data-mobile-view="preview" aria-pressed="true">
+      Preview
+    </button>
+    <button type="button" class="mobile-nav-btn" data-mobile-view="code" aria-pressed="false">
+      Code
+    </button>
+  </nav>
+
+  <main class="split">
+    <section class="pane pane-editor">
+      <div id="editor-host"></div>
+      <div id="console" class="console" hidden></div>
+    </section>
+
+    <div id="divider" class="divider" title="Drag to resize"></div>
+
+    <section class="pane pane-preview">
+      <div id="canvas-wrap" class="canvas-wrap">
+        <canvas id="glcanvas"></canvas>
+        <div id="fullscreen-hint" class="fullscreen-hint">
+          <span class="desktop-only">Press <strong>Esc</strong> to exit fullscreen</span>
+          <span class="mobile-only">Tap &#9974; again to exit</span>
+        </div>
+        <aside id="params-panel" class="params-panel" aria-label="Shader parameters">
+          <div class="params-sheet-handle" aria-hidden="true"></div>
+          <div class="params-header">
+            <h2>Controls</h2>
+            <div class="params-header-actions">
+              <button id="btn-params-reset" class="btn btn-ghost" type="button" title="Reset to defaults">Reset</button>
+              <button id="btn-params-close" class="btn btn-ghost params-close" type="button" title="Close controls" aria-label="Close controls">&times;</button>
+            </div>
+          </div>
+          <div id="params-list" class="params-list"></div>
+        </aside>
+      </div>
+      <div class="toolbar">
+        <button id="btn-rewind" class="tb-btn" title="Rewind (reset time)">&#9198;</button>
+        <button id="btn-play" class="tb-btn" title="Play / pause">&#9208;</button>
+        <button id="btn-params-toggle" class="tb-btn" title="Toggle controls" aria-pressed="true">&#9881;</button>
+        <button id="btn-fullscreen" class="tb-btn" title="Fullscreen shader (Esc to exit)" aria-pressed="false">&#9974;</button>
+        <span id="time-readout" class="tb-stat">0.00</span>
+        <span class="tb-sep"></span>
+        <span id="fps-readout" class="tb-stat">0.0 fps</span>
+        <span class="tb-sep desktop-only"></span>
+        <span id="res-readout" class="tb-stat desktop-only">0 × 0</span>
+      </div>
+    </section>
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/clike/clike.min.js"></script>
+  <script src="gradient-math.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

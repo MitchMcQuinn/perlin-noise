@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Shader compile diagnostics</title>
+<style>
+  body {
+    margin: 0;
+    padding: 20px;
+    background: #0d1117;
+    color: #d5dde6;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 13px;
+    line-height: 1.6;
+  }
+  h1 { font-size: 15px; margin: 0 0 4px; }
+  p.lead { color: #7d8894; margin: 0 0 18px; }
+  .case { border-top: 1px solid #232c38; padding: 10px 0; }
+  .name { font-weight: 600; }
+  .ok { color: #5fd68a; }
+  .fail { color: #ff5c6c; }
+  .skip { color: #7d8894; }
+  pre {
+    margin: 6px 0 0;
+    padding: 8px 10px;
+    background: #2a1216;
+    color: #ff5c6c;
+    border-radius: 6px;
+    white-space: pre-wrap;
+    overflow-x: auto;
+  }
+  #summary { margin-top: 18px; font-weight: 600; }
+</style>
+</head>
+<body>
+  <h1>Shader compile diagnostics</h1>
+  <p class="lead">
+    Compiles the default shader (and its 3D variants) against real WebGL2 / WebGL1
+    contexts. Serve the project and open this file, e.g.
+    <code>http://localhost:8000/tests/shader-compile.test.html</code>.
+  </p>
+  <div id="results"></div>
+  <div id="summary"></div>
+
+<script>
+"use strict";
+
+const resultsEl = document.getElementById("results");
+const summaryEl = document.getElementById("summary");
+let passed = 0;
+let failed = 0;
+let skipped = 0;
+
+function report(name, status, detail) {
+  const box = document.createElement("div");
+  box.className = "case";
+  const head = document.createElement("div");
+  head.className = "name " + status;
+  head.textContent = `${status === "ok" ? "ok  -" : status === "fail" ? "FAIL -" : "skip -"} ${name}`;
+  box.appendChild(head);
+  if (detail) {
+    const pre = document.createElement("pre");
+    pre.textContent = detail;
+    box.appendChild(pre);
+  }
+  resultsEl.appendChild(box);
+  if (status === "ok") passed += 1;
+  else if (status === "fail") failed += 1;
+  else skipped += 1;
+}
+
+/** Pull a template-literal constant out of app.js source text. */
+function extractLiteral(src, name) {
+  const m = src.match(new RegExp("const " + name + " = `([\\s\\S]*?)`;"));
+  if (!m) throw new Error(`could not find ${name} in app.js`);
+  return m[1];
+}
+
+/** Rewrite one `const <type> <name> = <value>;` line inside the controls block. */
+function setConst(shader, name, value) {
+  const re = new RegExp("(const\\s+(?:float|int|vec3)\\s+" + name + "\\s*=\\s*)[^;]+;");
+  if (!re.test(shader)) throw new Error(`no const named ${name}`);
+  return shader.replace(re, `$1${value};`);
+}
+
+function compile(gl, type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  const ok = gl.getShaderParameter(sh, gl.COMPILE_STATUS);
+  const log = gl.getShaderInfoLog(sh) || "";
+  return { ok, log, shader: sh };
+}
+
+/** Compile + link the wrapped user shader, mirroring buildProgram() in app.js. */
+function buildProgram(gl, isGL2, parts, userShader) {
+  const vertSrc = isGL2 ? parts.VERT_SRC_300 : parts.VERT_SRC_100;
+  const fragSrc = (isGL2 ? parts.HEADER_300 : parts.HEADER_100)
+    + userShader
+    + (isGL2 ? parts.FOOTER_300 : parts.FOOTER_100);
+
+  const vs = compile(gl, gl.VERTEX_SHADER, vertSrc);
+  const fs = compile(gl, gl.FRAGMENT_SHADER, fragSrc);
+  let result;
+
+  if (!vs.ok) {
+    result = { ok: false, log: "vertex shader: " + vs.log };
+  } else if (!fs.ok) {
+    result = { ok: false, log: fs.log };
+  } else {
+    const prog = gl.createProgram();
+    gl.attachShader(prog, vs.shader);
+    gl.attachShader(prog, fs.shader);
+    if (!isGL2) gl.bindAttribLocation(prog, 0, "aPos");
+    gl.linkProgram(prog);
+    const ok = gl.getProgramParameter(prog, gl.LINK_STATUS);
+    result = { ok, log: ok ? "" : (gl.getProgramInfoLog(prog) || "link failed") };
+    gl.deleteProgram(prog);
+  }
+
+  gl.deleteShader(vs.shader);
+  gl.deleteShader(fs.shader);
+  return result;
+}
+
+function contexts() {
+  const canvas = document.createElement("canvas");
+  canvas.width = 32;
+  canvas.height = 32;
+  const out = [];
+  const gl2 = canvas.getContext("webgl2", { antialias: false });
+  if (gl2) out.push({ label: "WebGL2 / GLSL ES 3.00", gl: gl2, isGL2: true });
+  const c1 = document.createElement("canvas");
+  const gl1 = c1.getContext("webgl", { antialias: false });
+  if (gl1) out.push({ label: "WebGL1 / GLSL ES 1.00", gl: gl1, isGL2: false });
+  return out;
+}
+
+async function run() {
+  let src;
+  try {
+    src = await fetch("../app.js", { cache: "no-store" }).then((r) => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.text();
+    });
+  } catch (err) {
+    report("fetch app.js", "fail", `${err.message}\nServe the folder over HTTP (file:// blocks fetch).`);
+    summaryEl.textContent = "1 failed";
+    return;
+  }
+
+  let parts;
+  let base;
+  try {
+    parts = {
+      VERT_SRC_300: extractLiteral(src, "VERT_SRC_300"),
+      VERT_SRC_100: extractLiteral(src, "VERT_SRC_100"),
+      HEADER_300: extractLiteral(src, "HEADER_300"),
+      FOOTER_300: extractLiteral(src, "FOOTER_300"),
+      HEADER_100: extractLiteral(src, "HEADER_100"),
+      FOOTER_100: extractLiteral(src, "FOOTER_100"),
+    };
+    base = extractLiteral(src, "DEFAULT_SHADER");
+  } catch (err) {
+    report("extract shader sources from app.js", "fail", err.message);
+    summaryEl.textContent = "1 failed";
+    return;
+  }
+  report("extract shader sources from app.js", "ok");
+
+  // Each variant flips consts the Controls panel would rewrite.
+  const variants = [
+    { name: "default (3D off)", shader: base },
+    {
+      name: "3D relief on",
+      shader: setConst(base, "u3D", "1"),
+    },
+    {
+      name: "3D relief + refraction",
+      shader: setConst(setConst(base, "u3D", "1"), "u3DRefract", "0.45"),
+    },
+    {
+      name: "3D relief + gradient color mode",
+      shader: setConst(setConst(base, "u3D", "1"), "uColorMode", "1"),
+    },
+    {
+      name: "3D relief + mouse interact + anchors",
+      shader: ["uMouseInteract:2", "uAnchorCount:3", "uA0Mode:4", "uA1Mode:1", "uA2Mode:5"]
+        .reduce((s, pair) => {
+          const [k, v] = pair.split(":");
+          return setConst(s, k, v);
+        }, setConst(base, "u3D", "1")),
+    },
+  ];
+
+  const ctxs = contexts();
+  if (ctxs.length === 0) {
+    report("acquire a WebGL context", "fail", "no WebGL1 or WebGL2 context available");
+    summaryEl.textContent = "1 failed";
+    return;
+  }
+  if (!ctxs.some((c) => c.isGL2)) {
+    report("WebGL2 context", "skip", "WebGL2 unavailable in this browser; only WebGL1 was tested");
+  }
+
+  for (const ctx of ctxs) {
+    for (const variant of variants) {
+      const res = buildProgram(ctx.gl, ctx.isGL2, parts, variant.shader);
+      report(`${ctx.label} — ${variant.name}`, res.ok ? "ok" : "fail", res.ok ? "" : res.log);
+    }
+  }
+
+  const bits = [`${passed} passed`];
+  if (failed) bits.push(`${failed} failed`);
+  if (skipped) bits.push(`${skipped} skipped`);
+  summaryEl.textContent = bits.join(", ");
+  summaryEl.className = failed ? "fail" : "ok";
+}
+
+run();
+</script>
+</body>
+</html>
