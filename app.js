@@ -65,6 +65,16 @@ const float u3DFresnel = 0.25;
 const float u3DRefract = 0.00;
 const float u3DShadow = 0.35;
 const vec3  u3DLightColor = vec3(1.000, 0.965, 0.910);
+const int   uCam = 0;
+const float uCamPitch = 45.00;
+const float uCamYaw = 0.00;
+const float uCamHeight = 1.00;
+const float uCamFov = 60.00;
+const float uCamFocus = 0.30;
+const float uCamFocusRange = 0.12;
+const float uCamAperture = 0.40;
+const float uCamHaze = 0.35;
+const vec3  uCamHazeColor = vec3(0.063, 0.082, 0.110);
 const int   uColorMode = 0;
 const float uHue = 0.00;
 const float uSaturation = 1.00;
@@ -112,16 +122,127 @@ float perlin(vec3 p) {
 }
 
 // --- Fractal Brownian Motion (octaves / lacunarity / gain from Controls) ---
-float fbm(vec3 p) {
+// lod is a fractional octave budget: the last kept octave fades in gradually,
+// so dropping it is smooth. Depth of field and horizon anti-aliasing both work
+// by lowering lod instead of taking extra samples.
+float fbmLod(vec3 p, float lod) {
     float value = 0.0;
     float amplitude = 0.5;
     for (int i = 0; i < 8; i++) {
         if (i >= uOctaves) break;
-        value += amplitude * perlin(p);
+        float w = clamp(lod - float(i), 0.0, 1.0);
+        if (w <= 0.0) break;
+        value += amplitude * w * perlin(p);
         p = p * uLacunarity + vec3(13.7, 7.3, 3.1);
         amplitude *= uGain;
     }
     return value;
+}
+
+float fbm(vec3 p) {
+    return fbmLod(p, float(uOctaves));
+}
+
+/* ---------- Camera: screen ray onto the noise plane ----------
+   With the camera off, sampling happens directly in screen space (uv). With it
+   on, every screen pixel is a ray cast at the plane z = 0, whose xy is the
+   noise domain — so tilting the camera views the field in perspective. */
+
+float camFocal() {
+    return 1.0 / tan(radians(clamp(uCamFov, 10.0, 140.0)) * 0.5);
+}
+
+// Returns the hit distance along the ray, or -1.0 when the ray passes above the
+// horizon. planeUv is the noise-domain coordinate, rayDir is kept for shading.
+float planeProject(vec2 sUv, out vec2 planeUv, out vec3 rayDir) {
+    float aspect = iResolution.x / iResolution.y;
+    vec2 centered = (sUv - 0.5 * vec2(aspect, 1.0)) * 2.0;
+
+    // Pitch 0 looks straight down (matches the flat view); 88 grazes the horizon
+    float elev = radians(90.0 - clamp(uCamPitch, 0.0, 88.0));
+    float sinE = sin(elev);
+    float cosE = cos(elev);
+    vec3 fwd   = vec3(0.0, cosE, -sinE);
+    vec3 right = vec3(1.0, 0.0, 0.0);
+    vec3 up    = vec3(0.0, sinE, cosE);
+
+    float h = max(uCamHeight, 0.05);
+    // Pull the camera back so the center ray always lands on the origin
+    vec3 ro = vec3(0.0, -h * cosE / max(sinE, 1e-3), h);
+    rayDir = normalize(fwd * camFocal() + right * centered.x + up * centered.y);
+
+    planeUv = vec2(0.0);
+    if (rayDir.z > -1e-4) return -1.0;
+
+    float dist = -ro.z / rayDir.z;
+    vec2 hit = ro.xy + dist * rayDir.xy;
+
+    float yaw = radians(uCamYaw);
+    float cosY = cos(yaw);
+    float sinY = sin(yaw);
+    planeUv = vec2(cosY * hit.x - sinY * hit.y, sinY * hit.x + cosY * hit.y);
+    return dist;
+}
+
+// Screen point -> sampling space, for the mouse and anchors. Points above the
+// horizon are pushed far away so their brushes simply have no reach.
+vec2 spaceCoord(vec2 sUv) {
+    if (uCam == 0) return sUv;
+    vec2 planeUv;
+    vec3 rayDir;
+    if (planeProject(sUv, planeUv, rayDir) < 0.0) return vec2(1e4);
+    return planeUv;
+}
+
+// Plane-space width of one pixel: grows with distance, which is what keeps
+// normals and fine octaves from shimmering as the surface recedes.
+float pixelFootprint(float dist, vec3 rayDir) {
+    return dist * (2.0 / (camFocal() * max(iResolution.y, 1.0))) / max(-rayDir.z, 0.02);
+}
+
+// Hyperbolic depth curve: compresses distance the way perspective does
+float depthCurve(float dist) {
+    return dist / (dist + 4.0 * max(uCamHeight, 0.05));
+}
+
+// Distance to the plane down the screen's center column (cy: -1 bottom, +1 top).
+// Used to normalize depth against what is actually visible, so Focus distance
+// means the same thing at every tilt. Negative when that ray sees only sky.
+float columnDist(float cy) {
+    float elev = radians(90.0 - clamp(uCamPitch, 0.0, 88.0));
+    float sinE = sin(elev);
+    float cosE = cos(elev);
+    float f = camFocal();
+    vec3 rd = normalize(vec3(0.0, cosE * f + sinE * cy, -sinE * f + cosE * cy));
+    if (rd.z > -1e-4) return -1.0;
+    return max(uCamHeight, 0.05) / -rd.z;
+}
+
+// 0 at the nearest visible depth, 1 at the farthest. Falls back to the raw
+// curve when the view is near top-down and has no meaningful depth spread.
+float viewDepth(float dist) {
+    float nearD = columnDist(-1.0);
+    float farD = columnDist(1.0);
+    if (nearD < 0.0) return depthCurve(dist);
+    if (farD < 0.0) farD = nearD * 60.0;   // horizon in frame: effectively infinite
+
+    float nearC = depthCurve(nearD);
+    float spread = depthCurve(farD) - nearC;
+    if (spread <= 0.02) return depthCurve(dist);
+    return clamp((depthCurve(dist) - nearC) / spread, 0.0, 1.0);
+}
+
+// Highest octave count that still resolves inside one pixel footprint
+float aliasLod(float footprint) {
+    float lanes = 1.0 / max(footprint * uScale * 2.0, 1e-5);
+    return log2(max(lanes, 2.0)) / log2(max(uLacunarity, 1.05));
+}
+
+// Circle of confusion: 0 in the focal band, rising to 1 at the depth extremes
+float focusCoc(float depth01) {
+    if (uCamAperture <= 0.001) return 0.0;
+    float offFocus = abs(depth01 - uCamFocus) - uCamFocusRange;
+    return clamp(offFocus / max(0.08, 1.0 - uCamFocusRange), 0.0, 1.0) * uCamAperture;
 }
 
 // --- Cosine palette (Inigo Quilez) ---
@@ -226,22 +347,25 @@ void applyInteractValue(inout float v, vec2 uv0, vec2 center, int mode, float ra
     }
 }
 
-// Anchor centers in uv space (X is viewport-normalized, so widen by aspect).
+// Anchor centers, from viewport-normalized X/Y (widen X by aspect) into
+// whichever space we are sampling in.
 vec2 anchorUv(int i) {
     float ar = iResolution.x / iResolution.y;
-    if (i == 0) return vec2(uA0X * ar, uA0Y);
-    if (i == 1) return vec2(uA1X * ar, uA1Y);
-    return vec2(uA2X * ar, uA2Y);
+    vec2 sUv = vec2(uA0X * ar, uA0Y);
+    if (i == 1) sUv = vec2(uA1X * ar, uA1Y);
+    if (i == 2) sUv = vec2(uA2X * ar, uA2Y);
+    return spaceCoord(sUv);
 }
 
 // --- Height field: warped fBm + value interactions + tone, in [0, 1] ---
 // uvW is the domain-warped coordinate; uv0 stays unwarped so brush falloffs
-// keep their screen position. 3D mode resamples this at neighboring points.
-float heightField(vec2 uvW, vec2 uv0, vec2 mUv, float mouseOn, float t) {
+// keep their position. 3D mode resamples this at neighboring points, and lod
+// trims fine octaves for defocus / distance.
+float heightField(vec2 uvW, vec2 uv0, vec2 mUv, float mouseOn, float t, float lod) {
     // Domain-warped fBm: fbm(p + fbm(p)) for extra swirl
     vec3 p = vec3(uvW * uScale, t);
-    float warp = fbm(p + vec3(fbm(p + vec3(t * 0.5)), fbm(p.yxz), 0.0));
-    float n = fbm(p + uWarp * warp);
+    float warp = fbmLod(p + vec3(fbmLod(p + vec3(t * 0.5), lod), fbmLod(p.yxz, lod), 0.0), lod);
+    float n = fbmLod(p + uWarp * warp, lod);
 
     float v = n * 0.5 + 0.5;
     applyInteractValue(v, uv0, mUv, uMouseInteract, uMouseRadius, uMouseBlur, uMouseStrength, mouseOn);
@@ -255,21 +379,22 @@ float heightField(vec2 uvW, vec2 uv0, vec2 mUv, float mouseOn, float t) {
 // --- Surface normal by forward differences on the height field ---
 // eps doubles as the smoothing control: a wider step averages over more
 // detail, so high-frequency octaves stop showing up as normal noise.
-vec3 surfaceNormal(vec2 uvW, vec2 uv0, vec2 mUv, float mouseOn, float t, float h, float eps) {
+vec3 surfaceNormal(vec2 uvW, vec2 uv0, vec2 mUv, float mouseOn, float t, float lod, float h, float eps) {
     vec2 dx = vec2(eps, 0.0);
     vec2 dy = vec2(0.0, eps);
-    float hx = heightField(uvW + dx, uv0 + dx, mUv, mouseOn, t);
-    float hy = heightField(uvW + dy, uv0 + dy, mUv, mouseOn, t);
+    float hx = heightField(uvW + dx, uv0 + dx, mUv, mouseOn, t, lod);
+    float hy = heightField(uvW + dy, uv0 + dy, mUv, mouseOn, t, lod);
     vec2 grad = vec2(hx - h, hy - h) / eps;
     return normalize(vec3(-grad * u3DRelief * 0.35, 1.0));
 }
 
 // --- Blinn-Phong + fresnel rim + height/slope occlusion ---
-vec3 shadeSurface(vec3 base, vec3 nrm, float h) {
+// viewDir points from the surface back toward the camera, so specular and rim
+// terms follow the camera when it tilts.
+vec3 shadeSurface(vec3 base, vec3 nrm, float h, vec3 viewDir) {
     float az = radians(u3DLightAngle);
     float el = radians(clamp(u3DLightElev, 1.0, 89.0));
     vec3 lightDir = normalize(vec3(cos(az) * cos(el), sin(az) * cos(el), sin(el)));
-    vec3 viewDir = vec3(0.0, 0.0, 1.0);
     vec3 halfDir = normalize(lightDir + viewDir);
 
     float diffuse = max(dot(nrm, lightDir), 0.0);
@@ -286,40 +411,72 @@ vec3 shadeSurface(vec3 base, vec3 nrm, float h) {
     return col;
 }
 
+vec3 applyVignette(vec3 col, vec2 fragCoord) {
+    vec2 q = fragCoord / iResolution.xy;
+    float vig = pow(16.0 * q.x * q.y * (1.0 - q.x) * (1.0 - q.y), 0.25);
+    return col * mix(1.0, 0.65 + 0.35 * vig, uVignette);
+}
+
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {
-    vec2 uv = fragCoord / iResolution.y;   // square pixels
-    vec2 uv0 = uv;
+    vec2 sUv = fragCoord / iResolution.y;   // screen space, square pixels
     // When Dynamic Speed is on, JS drives iTime at 0..2 from pointer velocity
     // and we treat uSpeed as 1 so the mapped rate is used as-is.
     float t = iTime * (uDynamicSpeed != 0 ? 1.0 : uSpeed);
 
     // Live mouse (iMouse.xy = lagged effect pos; z > 0 while active)
-    vec2 mUv = iMouse.xy / iResolution.y;
     float mouseOn = step(0.0, iMouse.z);
-    applyInteractDomain(uv, uv0, mUv, uMouseInteract, uMouseRadius, uMouseBlur, uMouseStrength, mouseOn);
 
-    // Fixed anchors (viewport-normalized X/Y → same space as uv)
+    // Sampling space: screen uv, or the noise plane seen through the camera
+    vec2 uv = sUv;
+    vec2 uv0 = sUv;
+    vec2 mUv = iMouse.xy / iResolution.y;
+    vec3 viewDir = vec3(0.0, 0.0, 1.0);
+    float footprint = 1.0 / max(iResolution.y, 1.0);
+    float lod = float(uOctaves);
+    float depth01 = 0.0;
+
+    if (uCam != 0) {
+        vec2 planeUv;
+        vec3 rayDir;
+        float dist = planeProject(sUv, planeUv, rayDir);
+        if (dist < 0.0) {
+            // Above the horizon there is no surface, only atmosphere
+            fragColor = vec4(clamp(applyVignette(uCamHazeColor, fragCoord), 0.0, 1.0), 1.0);
+            return;
+        }
+        uv = planeUv;
+        uv0 = planeUv;
+        mUv = spaceCoord(mUv);
+        viewDir = -rayDir;
+        footprint = pixelFootprint(dist, rayDir);
+        depth01 = viewDepth(dist);
+
+        float coc = focusCoc(depth01);
+        lod = min(mix(lod, 0.65, coc), aliasLod(footprint));
+        footprint *= 1.0 + coc * 6.0;   // defocus softens the relief too
+    }
+
+    applyInteractDomain(uv, uv0, mUv, uMouseInteract, uMouseRadius, uMouseBlur, uMouseStrength, mouseOn);
     if (uAnchorCount > 0) applyInteractDomain(uv, uv0, anchorUv(0), uA0Mode, uA0Radius, uA0Blur, uA0Strength, 1.0);
     if (uAnchorCount > 1) applyInteractDomain(uv, uv0, anchorUv(1), uA1Mode, uA1Radius, uA1Blur, uA1Strength, 1.0);
     if (uAnchorCount > 2) applyInteractDomain(uv, uv0, anchorUv(2), uA2Mode, uA2Radius, uA2Blur, uA2Strength, 1.0);
 
-    float v = heightField(uv, uv0, mUv, mouseOn, t);
+    float v = heightField(uv, uv0, mUv, mouseOn, t, lod);
     float cycle = t * uColorCycle;
     vec3 col;
 
     if (u3D != 0) {
         // Step at least ~1 pixel so normals never alias, then widen with Smoothing
-        float px = 1.0 / max(iResolution.y, 1.0);
-        float eps = max(px * 1.25, mix(0.0015, 0.03, clamp(u3DSmooth, 0.0, 1.0)));
-        vec3 nrm = surfaceNormal(uv, uv0, mUv, mouseOn, t, v, eps);
+        float eps = max(footprint * 1.25, mix(0.0015, 0.03, clamp(u3DSmooth, 0.0, 1.0)));
+        vec3 nrm = surfaceNormal(uv, uv0, mUv, mouseOn, t, lod, v, eps);
 
         float shadeV = v;
         if (u3DRefract > 0.001) {
             // Bend the view ray through the surface and resample the field there.
             // Channels bend by different amounts, which reads as dispersion.
-            vec3 rd = refract(vec3(0.0, 0.0, -1.0), nrm, 1.0 / mix(1.0, 1.6, u3DRefract));
+            vec3 rd = refract(-viewDir, nrm, 1.0 / mix(1.0, 1.6, u3DRefract));
             vec2 off = rd.xy * u3DRefract * 0.22;
-            float vR = heightField(uv + off, uv0 + off, mUv, mouseOn, t);
+            float vR = heightField(uv + off, uv0 + off, mUv, mouseOn, t, lod);
             col = vec3(colorize(vR + cycle).r,
                        colorize(mix(v, vR, 0.82) + cycle).g,
                        colorize(mix(v, vR, 0.64) + cycle).b);
@@ -328,7 +485,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
             col = colorize(v + cycle);
         }
 
-        col = shadeSurface(col, nrm, shadeV);
+        col = shadeSurface(col, nrm, shadeV, viewDir);
     } else {
         col = colorize(v + cycle);
         if (uColorMode == 0) {
@@ -338,11 +495,12 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
         }
     }
 
-    vec2 q = fragCoord / iResolution.xy;
-    float vig = pow(16.0 * q.x * q.y * (1.0 - q.x) * (1.0 - q.y), 0.25);
-    col *= mix(1.0, 0.65 + 0.35 * vig, uVignette);
+    if (uCam != 0 && uCamHaze > 0.001) {
+        float fog = 1.0 - exp(-uCamHaze * 3.0 * depth01);
+        col = mix(col, uCamHazeColor, clamp(fog, 0.0, 1.0));
+    }
 
-    fragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+    fragColor = vec4(clamp(applyVignette(col, fragCoord), 0.0, 1.0), 1.0);
 }
 `;
 
@@ -527,6 +685,21 @@ const THREED_SLIDER_DEFS = [
 
 const DEFAULT_LIGHT_COLOR = "#fff6e8";
 
+/* Perspective camera: each pixel becomes a ray cast at the noise plane, so tilt
+ * and focus are geometric rather than screen-space effects. */
+const CAMERA_SLIDER_DEFS = [
+  { key: "uCamPitch",      label: "Tilt",         min: 0,  max: 88,  step: 1,    value: 45,   format: (v) => `${Math.round(v)}\u00b0` },
+  { key: "uCamYaw",        label: "Orbit",        min: 0,  max: 360, step: 1,    value: 0,    format: (v) => `${Math.round(v)}\u00b0` },
+  { key: "uCamHeight",     label: "Elevation",    min: 0.2, max: 4,  step: 0.01, value: 1.0,  format: (v) => v.toFixed(2) },
+  { key: "uCamFov",        label: "Field of view", min: 20, max: 100, step: 1,   value: 60,   format: (v) => `${Math.round(v)}\u00b0` },
+  { key: "uCamFocus",      label: "Focus distance", min: 0, max: 1,  step: 0.01, value: 0.3,  format: (v) => v.toFixed(2) },
+  { key: "uCamFocusRange", label: "Focus range",  min: 0,  max: 0.6, step: 0.01, value: 0.12, format: (v) => v.toFixed(2) },
+  { key: "uCamAperture",   label: "Aperture",     min: 0,  max: 1,   step: 0.01, value: 0.4,  format: (v) => v.toFixed(2) },
+  { key: "uCamHaze",       label: "Depth fade",   min: 0,  max: 1,   step: 0.01, value: 0.35, format: (v) => v.toFixed(2) },
+];
+
+const DEFAULT_HAZE_COLOR = "#10151c";
+
 const MOUSE_SLIDER_DEFS = [
   { key: "uMouseRadius",   label: "Radius",   min: 0.05, max: 1.2, step: 0.01, value: 0.35, format: (v) => v.toFixed(2) },
   { key: "uMouseBlur",     label: "Blur",     min: 0,    max: 1,   step: 0.01, value: 0.55, format: (v) => v.toFixed(2) },
@@ -571,9 +744,12 @@ for (const def of PARAM_DEFS) params[def.key] = def.value;
 for (const def of COLOR_SLIDER_DEFS) params[def.key] = def.value;
 for (const def of MOUSE_SLIDER_DEFS) params[def.key] = def.value;
 for (const def of THREED_SLIDER_DEFS) params[def.key] = def.value;
+for (const def of CAMERA_SLIDER_DEFS) params[def.key] = def.value;
 params.uColorMode = 0;
 params.u3D = 0;
 params.lightColor = DEFAULT_LIGHT_COLOR;
+params.uCam = 0;
+params.hazeColor = DEFAULT_HAZE_COLOR;
 params.uDynamicSpeed = 0;
 params.uMouseInteract = 0;
 params.uMouseLagMode = 0;
@@ -593,6 +769,8 @@ let mouseLagSelect = null;
 let dynamicSpeedInput = null;
 let threeDInput = null;
 let lightColorInput = null;
+let cameraInput = null;
+let hazeColorInput = null;
 let stopsHostEl = null;
 let stopCountLabelEl = null;
 let anchorsHostEl = null;
@@ -657,6 +835,11 @@ function buildParamsBlock(src) {
     lines.push(`const float ${def.key} = ${formatGlslLiteral(def, p[def.key])};`);
   }
   lines.push(`const vec3  u3DLightColor = ${formatVec3(p.lightColor || DEFAULT_LIGHT_COLOR)};`);
+  lines.push(`const int   uCam = ${p.uCam ? 1 : 0};`);
+  for (const def of CAMERA_SLIDER_DEFS) {
+    lines.push(`const float ${def.key} = ${formatGlslLiteral(def, p[def.key])};`);
+  }
+  lines.push(`const vec3  uCamHazeColor = ${formatVec3(p.hazeColor || DEFAULT_HAZE_COLOR)};`);
   lines.push(`const int   uColorMode = ${p.uColorMode};`);
   for (const def of COLOR_SLIDER_DEFS) {
     lines.push(`const float ${def.key} = ${formatGlslLiteral(def, p[def.key])};`);
@@ -712,6 +895,15 @@ function updateThreeDVisibility() {
   if (valueEls.u3D) valueEls.u3D.textContent = on ? "on" : "off";
 }
 
+function updateCameraVisibility() {
+  const on = !!params.uCam;
+  paramsList.querySelectorAll("[data-camera]").forEach((el) => {
+    el.hidden = !on;
+  });
+  if (cameraInput) cameraInput.checked = on;
+  if (valueEls.uCam) valueEls.uCam.textContent = on ? "on" : "off";
+}
+
 function updateColorModeVisibility() {
   const mode = params.uColorMode;
   paramsList.querySelectorAll("[data-color-mode]").forEach((el) => {
@@ -725,15 +917,24 @@ function updateColorModeVisibility() {
 }
 
 function applyParamsToUI() {
-  for (const def of [...PARAM_DEFS, ...COLOR_SLIDER_DEFS, ...MOUSE_SLIDER_DEFS, ...THREED_SLIDER_DEFS]) {
+  const allDefs = [
+    ...PARAM_DEFS,
+    ...COLOR_SLIDER_DEFS,
+    ...MOUSE_SLIDER_DEFS,
+    ...THREED_SLIDER_DEFS,
+    ...CAMERA_SLIDER_DEFS,
+  ];
+  for (const def of allDefs) {
     const input = document.getElementById("param-" + def.key);
     if (input) input.value = String(params[def.key]);
     if (valueEls[def.key]) valueEls[def.key].textContent = def.format(params[def.key]);
   }
   if (dynamicSpeedInput) dynamicSpeedInput.checked = !!params.uDynamicSpeed;
   if (lightColorInput) lightColorInput.value = params.lightColor || DEFAULT_LIGHT_COLOR;
+  if (hazeColorInput) hazeColorInput.value = params.hazeColor || DEFAULT_HAZE_COLOR;
   updateDynamicSpeedUI();
   updateThreeDVisibility();
+  updateCameraVisibility();
   updateColorModeVisibility();
   renderAnchorsUI();
 }
@@ -760,7 +961,14 @@ function parseAnchorFromCode(code, i) {
 
 function parseParamsFromCode(code) {
   let changed = false;
-  for (const def of [...PARAM_DEFS, ...COLOR_SLIDER_DEFS, ...MOUSE_SLIDER_DEFS, ...THREED_SLIDER_DEFS]) {
+  const parseDefs = [
+    ...PARAM_DEFS,
+    ...COLOR_SLIDER_DEFS,
+    ...MOUSE_SLIDER_DEFS,
+    ...THREED_SLIDER_DEFS,
+    ...CAMERA_SLIDER_DEFS,
+  ];
+  for (const def of parseDefs) {
     const re = new RegExp(
       "const\\s+(?:float|int)\\s+" + def.key + "\\s*=\\s*([-]?[0-9]*\\.?[0-9]+)\\s*;"
     );
@@ -797,6 +1005,23 @@ function parseParamsFromCode(code) {
     const hex = rgb01ToHex(parseFloat(lightM[1]), parseFloat(lightM[2]), parseFloat(lightM[3]));
     if (hex.toLowerCase() !== String(params.lightColor || "").toLowerCase()) {
       params.lightColor = hex;
+      changed = true;
+    }
+  }
+
+  const camM = code.match(/const\s+int\s+uCam\s*=\s*(\d+)\s*;/);
+  if (camM) {
+    const v = parseInt(camM[1], 10) ? 1 : 0;
+    if (v !== params.uCam) { params.uCam = v; changed = true; }
+  }
+
+  const hazeM = code.match(
+    /const\s+vec3\s+uCamHazeColor\s*=\s*vec3\(\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*\)\s*;/
+  );
+  if (hazeM) {
+    const hex = rgb01ToHex(parseFloat(hazeM[1]), parseFloat(hazeM[2]), parseFloat(hazeM[3]));
+    if (hex.toLowerCase() !== String(params.hazeColor || "").toLowerCase()) {
+      params.hazeColor = hex;
       changed = true;
     }
   }
@@ -909,6 +1134,84 @@ function makeSliderRow(def) {
   return row;
 }
 
+/** Checkbox row plus explanatory hint, used by the 3D and Camera sections. */
+function makeToggleBlock(opts) {
+  const block = document.createElement("div");
+  block.className = "param-toggle-block";
+
+  const row = document.createElement("div");
+  row.className = "param-row param-toggle-row";
+
+  const label = document.createElement("label");
+  label.className = "param-label param-toggle-label";
+  label.htmlFor = "param-" + opts.key;
+  const name = document.createElement("span");
+  name.textContent = opts.label;
+  const status = document.createElement("span");
+  status.className = "value";
+  status.textContent = params[opts.key] ? "on" : "off";
+  valueEls[opts.key] = status;
+  label.appendChild(name);
+  label.appendChild(status);
+
+  const input = document.createElement("input");
+  input.type = "checkbox";
+  input.id = "param-" + opts.key;
+  input.className = "param-checkbox";
+  input.checked = !!params[opts.key];
+  if (opts.title) input.title = opts.title;
+  input.addEventListener("change", () => {
+    params[opts.key] = input.checked ? 1 : 0;
+    opts.onChange();
+    syncParamsToEditor();
+  });
+
+  const wrap = document.createElement("div");
+  wrap.className = "param-toggle-wrap";
+  wrap.appendChild(input);
+
+  row.appendChild(label);
+  row.appendChild(wrap);
+  block.appendChild(row);
+
+  if (opts.hint) {
+    const hint = document.createElement("p");
+    hint.className = "param-hint";
+    hint.textContent = opts.hint;
+    block.appendChild(hint);
+  }
+
+  return { block, input };
+}
+
+/** Color swatch row (light color, haze color). */
+function makeColorRow(opts) {
+  const row = document.createElement("div");
+  row.className = "param-row param-toggle-row";
+  if (opts.dataAttr) row.setAttribute(opts.dataAttr, "1");
+
+  const label = document.createElement("label");
+  label.className = "param-label param-toggle-label";
+  label.htmlFor = "param-" + opts.key;
+  const name = document.createElement("span");
+  name.textContent = opts.label;
+  label.appendChild(name);
+
+  const input = document.createElement("input");
+  input.type = "color";
+  input.id = "param-" + opts.key;
+  input.className = "light-color-input";
+  input.value = opts.value;
+  input.addEventListener("input", () => {
+    opts.onInput(input.value);
+    syncParamsToEditor();
+  });
+
+  row.appendChild(label);
+  row.appendChild(input);
+  return { row, input };
+}
+
 function updateDynamicSpeedUI() {
   const speedInput = document.getElementById("param-uSpeed");
   const on = !!params.uDynamicSpeed;
@@ -929,51 +1232,15 @@ function updateDynamicSpeedUI() {
 }
 
 function makeDynamicSpeedToggle() {
-  const row = document.createElement("div");
-  row.className = "param-row param-toggle-row";
-
-  const label = document.createElement("label");
-  label.className = "param-label param-toggle-label";
-  label.htmlFor = "param-uDynamicSpeed";
-
-  const name = document.createElement("span");
-  name.textContent = "Dynamic speed";
-
-  const status = document.createElement("span");
-  status.className = "value";
-  status.textContent = params.uDynamicSpeed ? "on" : "off";
-  valueEls.uDynamicSpeed = status;
-
-  label.appendChild(name);
-  label.appendChild(status);
-
-  dynamicSpeedInput = document.createElement("input");
-  dynamicSpeedInput.type = "checkbox";
-  dynamicSpeedInput.id = "param-uDynamicSpeed";
-  dynamicSpeedInput.className = "param-checkbox";
-  dynamicSpeedInput.checked = !!params.uDynamicSpeed;
-  dynamicSpeedInput.title = "Drive animation speed from pointer velocity (0–2)";
-  dynamicSpeedInput.addEventListener("change", () => {
-    params.uDynamicSpeed = dynamicSpeedInput.checked ? 1 : 0;
-    updateDynamicSpeedUI();
-    syncParamsToEditor();
+  const made = makeToggleBlock({
+    key: "uDynamicSpeed",
+    label: "Dynamic speed",
+    title: "Drive animation speed from pointer velocity (0\u20132)",
+    hint: "Animation speed follows pointer velocity over the preview (mouse or finger drag): 0 when still, up to 2 when moving quickly.",
+    onChange: updateDynamicSpeedUI,
   });
-
-  const wrap = document.createElement("div");
-  wrap.className = "param-toggle-wrap";
-  wrap.appendChild(dynamicSpeedInput);
-
-  const help = document.createElement("p");
-  help.className = "param-hint";
-  help.textContent = "Animation speed follows pointer velocity over the preview (mouse or finger drag): 0 when still, up to 2 when moving quickly.";
-
-  row.appendChild(label);
-  row.appendChild(wrap);
-  const block = document.createElement("div");
-  block.className = "param-toggle-block";
-  block.appendChild(row);
-  block.appendChild(help);
-  return block;
+  dynamicSpeedInput = made.input;
+  return made.block;
 }
 
 function renderStopPickers() {
@@ -1156,49 +1423,15 @@ function buildThreeDSection() {
   title.textContent = "3D & Lighting";
   section.appendChild(title);
 
-  const row = document.createElement("div");
-  row.className = "param-row param-toggle-row";
-
-  const label = document.createElement("label");
-  label.className = "param-label param-toggle-label";
-  label.htmlFor = "param-u3D";
-  const name = document.createElement("span");
-  name.textContent = "3D relief";
-  const status = document.createElement("span");
-  status.className = "value";
-  status.textContent = params.u3D ? "on" : "off";
-  valueEls.u3D = status;
-  label.appendChild(name);
-  label.appendChild(status);
-
-  threeDInput = document.createElement("input");
-  threeDInput.type = "checkbox";
-  threeDInput.id = "param-u3D";
-  threeDInput.className = "param-checkbox";
-  threeDInput.checked = !!params.u3D;
-  threeDInput.title = "Light the noise as a 3D surface";
-  threeDInput.addEventListener("change", () => {
-    params.u3D = threeDInput.checked ? 1 : 0;
-    updateThreeDVisibility();
-    syncParamsToEditor();
+  const made = makeToggleBlock({
+    key: "u3D",
+    label: "3D relief",
+    title: "Light the noise as a 3D surface",
+    hint: "Treats the noise as a heightfield: normals are lit with diffuse, specular, and rim terms. Costs extra fBm samples per pixel, so it is free while switched off.",
+    onChange: updateThreeDVisibility,
   });
-
-  const wrap = document.createElement("div");
-  wrap.className = "param-toggle-wrap";
-  wrap.appendChild(threeDInput);
-
-  row.appendChild(label);
-  row.appendChild(wrap);
-
-  const block = document.createElement("div");
-  block.className = "param-toggle-block";
-  block.appendChild(row);
-
-  const hint = document.createElement("p");
-  hint.className = "param-hint";
-  hint.textContent = "Treats the noise as a heightfield: normals are lit with diffuse, specular, and rim terms. Costs extra fBm samples per pixel, so it is free while switched off.";
-  block.appendChild(hint);
-  section.appendChild(block);
+  threeDInput = made.input;
+  section.appendChild(made.block);
 
   for (const def of THREED_SLIDER_DEFS) {
     const sliderRow = makeSliderRow(def);
@@ -1206,31 +1439,65 @@ function buildThreeDSection() {
     section.appendChild(sliderRow);
   }
 
-  const colorRow = document.createElement("div");
-  colorRow.className = "param-row param-toggle-row";
-  colorRow.setAttribute("data-threed", "1");
-  const colorLabel = document.createElement("label");
-  colorLabel.className = "param-label param-toggle-label";
-  colorLabel.htmlFor = "param-u3DLightColor";
-  colorLabel.innerHTML = "<span>Light color</span>";
-  lightColorInput = document.createElement("input");
-  lightColorInput.type = "color";
-  lightColorInput.id = "param-u3DLightColor";
-  lightColorInput.className = "light-color-input";
-  lightColorInput.value = params.lightColor || DEFAULT_LIGHT_COLOR;
-  lightColorInput.addEventListener("input", () => {
-    params.lightColor = lightColorInput.value;
-    syncParamsToEditor();
+  const lightRow = makeColorRow({
+    key: "u3DLightColor",
+    label: "Light color",
+    value: params.lightColor || DEFAULT_LIGHT_COLOR,
+    dataAttr: "data-threed",
+    onInput: (hex) => { params.lightColor = hex; },
   });
-  colorRow.appendChild(colorLabel);
-  colorRow.appendChild(lightColorInput);
-  section.appendChild(colorRow);
+  lightColorInput = lightRow.input;
+  section.appendChild(lightRow.row);
 
   const refractHint = document.createElement("p");
   refractHint.className = "param-hint";
   refractHint.setAttribute("data-threed", "1");
   refractHint.textContent = "Refraction bends the view ray through the surface and resamples the field, splitting channels for a glassy dispersion. Raise Smoothing if the relief looks grainy.";
   section.appendChild(refractHint);
+
+  return section;
+}
+
+function buildCameraSection() {
+  const section = document.createElement("div");
+  section.className = "param-section";
+
+  const title = document.createElement("div");
+  title.className = "param-section-title";
+  title.textContent = "Camera";
+  section.appendChild(title);
+
+  const made = makeToggleBlock({
+    key: "uCam",
+    label: "Perspective",
+    title: "View the noise plane through a tilting camera",
+    hint: "Casts a ray per pixel at the noise plane, so Tilt and Orbit move the viewpoint instead of just panning the pattern. Mouse and anchor brushes land on the surface in perspective.",
+    onChange: updateCameraVisibility,
+  });
+  cameraInput = made.input;
+  section.appendChild(made.block);
+
+  for (const def of CAMERA_SLIDER_DEFS) {
+    const sliderRow = makeSliderRow(def);
+    sliderRow.setAttribute("data-camera", "1");
+    section.appendChild(sliderRow);
+  }
+
+  const hazeRow = makeColorRow({
+    key: "uCamHazeColor",
+    label: "Haze color",
+    value: params.hazeColor || DEFAULT_HAZE_COLOR,
+    dataAttr: "data-camera",
+    onInput: (hex) => { params.hazeColor = hex; },
+  });
+  hazeColorInput = hazeRow.input;
+  section.appendChild(hazeRow.row);
+
+  const focusHint = document.createElement("p");
+  focusHint.className = "param-hint";
+  focusHint.setAttribute("data-camera", "1");
+  focusHint.textContent = "Focus distance runs 0 (nearest) to 1 (horizon), with Focus range as the sharp band around it. Aperture sets how much detail defocused depths lose \u2014 there is no extra sampling cost. Depth fade blends distance into the haze color, which also fills the sky above the horizon.";
+  section.appendChild(focusHint);
 
   return section;
 }
@@ -1495,6 +1762,8 @@ const SCALAR_PARAM_KEYS = [
   "uDynamicSpeed",
   "u3D",
   ...THREED_SLIDER_DEFS.map((d) => d.key),
+  "uCam",
+  ...CAMERA_SLIDER_DEFS.map((d) => d.key),
   "uMouseInteract",
   "uMouseLagMode",
   ...MOUSE_SLIDER_DEFS.map((d) => d.key),
@@ -1507,6 +1776,7 @@ function serializeParams() {
   const out = {};
   for (const k of SCALAR_PARAM_KEYS) out[k] = params[k];
   out.lightColor = params.lightColor || DEFAULT_LIGHT_COLOR;
+  out.hazeColor = params.hazeColor || DEFAULT_HAZE_COLOR;
   out.stops = params.stops.slice();
   out.positions = params.positions.slice();
   out.anchors = params.anchors.map((a) => ({ ...a }));
@@ -1522,10 +1792,15 @@ function applySerializedParams(cfg) {
 
   params.uDynamicSpeed = params.uDynamicSpeed ? 1 : 0;
   params.u3D = params.u3D ? 1 : 0;
+  params.uCam = params.uCam ? 1 : 0;
   params.uStopCount = Math.max(MIN_STOPS, Math.min(MAX_STOPS, params.uStopCount | 0));
 
-  if (typeof cfg.lightColor === "string" && /^#[0-9a-f]{3,6}$/i.test(cfg.lightColor)) {
+  const hexRe = /^#[0-9a-f]{3,6}$/i;
+  if (typeof cfg.lightColor === "string" && hexRe.test(cfg.lightColor)) {
     params.lightColor = cfg.lightColor;
+  }
+  if (typeof cfg.hazeColor === "string" && hexRe.test(cfg.hazeColor)) {
+    params.hazeColor = cfg.hazeColor;
   }
 
   if (Array.isArray(cfg.stops)) {
@@ -2068,11 +2343,13 @@ function buildParamsUI() {
   }
 
   paramsList.appendChild(buildThreeDSection());
+  paramsList.appendChild(buildCameraSection());
   paramsList.appendChild(buildMouseSection());
   paramsList.appendChild(buildColorSection());
   updateColorModeVisibility();
   updateDynamicSpeedUI();
   updateThreeDVisibility();
+  updateCameraVisibility();
 }
 
 /* ============================================================
@@ -2524,10 +2801,13 @@ function resetParams() {
   for (const def of COLOR_SLIDER_DEFS) params[def.key] = def.value;
   for (const def of MOUSE_SLIDER_DEFS) params[def.key] = def.value;
   for (const def of THREED_SLIDER_DEFS) params[def.key] = def.value;
+  for (const def of CAMERA_SLIDER_DEFS) params[def.key] = def.value;
   params.uColorMode = 0;
   params.uDynamicSpeed = 0;
   params.u3D = 0;
   params.lightColor = DEFAULT_LIGHT_COLOR;
+  params.uCam = 0;
+  params.hazeColor = DEFAULT_HAZE_COLOR;
   params.uMouseInteract = 0;
   params.uMouseLagMode = 0;
   params.uStopCount = 4;

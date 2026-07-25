@@ -36,13 +36,14 @@
 <body>
   <h1>Shader compile diagnostics</h1>
   <p class="lead">
-    Compiles the default shader (and its 3D variants) against real WebGL2 / WebGL1
+    Compiles the default shader (and its 3D / camera variants) against real WebGL2 / WebGL1
     contexts. Serve the project and open this file, e.g.
     <code>http://localhost:8000/tests/shader-compile.test.html</code>.
   </p>
   <div id="results"></div>
   <div id="summary"></div>
 
+<script src="shader-harness.js"></script>
 <script>
 "use strict";
 
@@ -70,59 +71,7 @@ function report(name, status, detail) {
   else skipped += 1;
 }
 
-/** Pull a template-literal constant out of app.js source text. */
-function extractLiteral(src, name) {
-  const m = src.match(new RegExp("const " + name + " = `([\\s\\S]*?)`;"));
-  if (!m) throw new Error(`could not find ${name} in app.js`);
-  return m[1];
-}
-
-/** Rewrite one `const <type> <name> = <value>;` line inside the controls block. */
-function setConst(shader, name, value) {
-  const re = new RegExp("(const\\s+(?:float|int|vec3)\\s+" + name + "\\s*=\\s*)[^;]+;");
-  if (!re.test(shader)) throw new Error(`no const named ${name}`);
-  return shader.replace(re, `$1${value};`);
-}
-
-function compile(gl, type, src) {
-  const sh = gl.createShader(type);
-  gl.shaderSource(sh, src);
-  gl.compileShader(sh);
-  const ok = gl.getShaderParameter(sh, gl.COMPILE_STATUS);
-  const log = gl.getShaderInfoLog(sh) || "";
-  return { ok, log, shader: sh };
-}
-
-/** Compile + link the wrapped user shader, mirroring buildProgram() in app.js. */
-function buildProgram(gl, isGL2, parts, userShader) {
-  const vertSrc = isGL2 ? parts.VERT_SRC_300 : parts.VERT_SRC_100;
-  const fragSrc = (isGL2 ? parts.HEADER_300 : parts.HEADER_100)
-    + userShader
-    + (isGL2 ? parts.FOOTER_300 : parts.FOOTER_100);
-
-  const vs = compile(gl, gl.VERTEX_SHADER, vertSrc);
-  const fs = compile(gl, gl.FRAGMENT_SHADER, fragSrc);
-  let result;
-
-  if (!vs.ok) {
-    result = { ok: false, log: "vertex shader: " + vs.log };
-  } else if (!fs.ok) {
-    result = { ok: false, log: fs.log };
-  } else {
-    const prog = gl.createProgram();
-    gl.attachShader(prog, vs.shader);
-    gl.attachShader(prog, fs.shader);
-    if (!isGL2) gl.bindAttribLocation(prog, 0, "aPos");
-    gl.linkProgram(prog);
-    const ok = gl.getProgramParameter(prog, gl.LINK_STATUS);
-    result = { ok, log: ok ? "" : (gl.getProgramInfoLog(prog) || "link failed") };
-    gl.deleteProgram(prog);
-  }
-
-  gl.deleteShader(vs.shader);
-  gl.deleteShader(fs.shader);
-  return result;
-}
+const H = window.ShaderHarness;
 
 function contexts() {
   const canvas = document.createElement("canvas");
@@ -138,59 +87,58 @@ function contexts() {
 }
 
 async function run() {
-  let src;
-  try {
-    src = await fetch("../app.js", { cache: "no-store" }).then((r) => {
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      return r.text();
-    });
-  } catch (err) {
-    report("fetch app.js", "fail", `${err.message}\nServe the folder over HTTP (file:// blocks fetch).`);
-    summaryEl.textContent = "1 failed";
-    return;
-  }
-
   let parts;
   let base;
   try {
-    parts = {
-      VERT_SRC_300: extractLiteral(src, "VERT_SRC_300"),
-      VERT_SRC_100: extractLiteral(src, "VERT_SRC_100"),
-      HEADER_300: extractLiteral(src, "HEADER_300"),
-      FOOTER_300: extractLiteral(src, "FOOTER_300"),
-      HEADER_100: extractLiteral(src, "HEADER_100"),
-      FOOTER_100: extractLiteral(src, "FOOTER_100"),
-    };
-    base = extractLiteral(src, "DEFAULT_SHADER");
+    const sources = await H.loadSources("../app.js");
+    parts = sources.parts;
+    base = sources.shader;
   } catch (err) {
-    report("extract shader sources from app.js", "fail", err.message);
+    report("extract shader sources from app.js", "fail",
+      `${err.message}\nServe the folder over HTTP (file:// blocks fetch).`);
     summaryEl.textContent = "1 failed";
     return;
   }
   report("extract shader sources from app.js", "ok");
 
+  const withConsts = (pairs) => H.withConsts(base, pairs);
+
   // Each variant flips consts the Controls panel would rewrite.
   const variants = [
-    { name: "default (3D off)", shader: base },
-    {
-      name: "3D relief on",
-      shader: setConst(base, "u3D", "1"),
-    },
-    {
-      name: "3D relief + refraction",
-      shader: setConst(setConst(base, "u3D", "1"), "u3DRefract", "0.45"),
-    },
-    {
-      name: "3D relief + gradient color mode",
-      shader: setConst(setConst(base, "u3D", "1"), "uColorMode", "1"),
-    },
+    { name: "default (3D + camera off)", shader: base },
+    { name: "3D relief on", shader: withConsts({ u3D: "1" }) },
+    { name: "3D relief + refraction", shader: withConsts({ u3D: "1", u3DRefract: "0.45" }) },
+    { name: "3D relief + gradient color mode", shader: withConsts({ u3D: "1", uColorMode: "1" }) },
     {
       name: "3D relief + mouse interact + anchors",
-      shader: ["uMouseInteract:2", "uAnchorCount:3", "uA0Mode:4", "uA1Mode:1", "uA2Mode:5"]
-        .reduce((s, pair) => {
-          const [k, v] = pair.split(":");
-          return setConst(s, k, v);
-        }, setConst(base, "u3D", "1")),
+      shader: withConsts({
+        u3D: "1", uMouseInteract: "2", uAnchorCount: "3",
+        uA0Mode: "4", uA1Mode: "1", uA2Mode: "5",
+      }),
+    },
+    { name: "camera on", shader: withConsts({ uCam: "1" }) },
+    { name: "camera top-down (pitch 0)", shader: withConsts({ uCam: "1", uCamPitch: "0.0" }) },
+    {
+      name: "camera grazing horizon + depth fade",
+      shader: withConsts({ uCam: "1", uCamPitch: "88.0", uCamHaze: "0.9" }),
+    },
+    {
+      name: "camera + depth of field",
+      shader: withConsts({ uCam: "1", uCamAperture: "1.0", uCamFocus: "0.8" }),
+    },
+    { name: "camera + 3D relief", shader: withConsts({ uCam: "1", u3D: "1" }) },
+    {
+      name: "camera + 3D + refraction + depth of field",
+      shader: withConsts({
+        uCam: "1", uCamAperture: "0.8", u3D: "1", u3DRefract: "0.4",
+      }),
+    },
+    {
+      name: "camera + 3D + gradient + interact + anchors",
+      shader: withConsts({
+        uCam: "1", u3D: "1", uColorMode: "1", uMouseInteract: "2",
+        uAnchorCount: "3", uA0Mode: "4", uA1Mode: "1", uA2Mode: "5",
+      }),
     },
   ];
 
@@ -206,7 +154,7 @@ async function run() {
 
   for (const ctx of ctxs) {
     for (const variant of variants) {
-      const res = buildProgram(ctx.gl, ctx.isGL2, parts, variant.shader);
+      const res = H.checkProgram(ctx.gl, ctx.isGL2, parts, variant.shader);
       report(`${ctx.label} — ${variant.name}`, res.ok ? "ok" : "fail", res.ok ? "" : res.log);
     }
   }

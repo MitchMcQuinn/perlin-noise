@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Camera render diagnostics</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; padding: 24px 28px 60px;
+    background: #0b0e13; color: #e6e9ef;
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  h1 { font-size: 19px; margin: 0 0 6px; }
+  .lead { color: #9aa4b2; margin: 0 0 22px; max-width: 70ch; }
+  code { background: #161b22; padding: 1px 5px; border-radius: 4px; }
+  .grid { display: grid; gap: 18px; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
+  .shot { background: #10151c; border: 1px solid #222a35; border-radius: 10px; overflow: hidden; }
+  .shot canvas { display: block; width: 100%; height: auto; background: #000; }
+  .shot .caption { padding: 8px 11px; border-top: 1px solid #222a35; }
+  .shot .caption b { font-weight: 600; }
+  .shot .caption span { color: #9aa4b2; display: block; font-size: 12px; font-family: ui-monospace, monospace; }
+  #checks { margin-top: 26px; }
+  .case { border-left: 3px solid #2b3543; padding: 3px 0 3px 11px; margin-bottom: 7px; font-family: ui-monospace, monospace; font-size: 13px; }
+  .ok { color: #57d38c; border-color: #1f6b45; }
+  .fail { color: #ff6b78; border-color: #7a2530; }
+  pre { margin: 6px 0 0; white-space: pre-wrap; color: #ffb3b3; font-size: 12px; }
+  #summary { margin-top: 18px; font-weight: 600; }
+</style>
+</head>
+<body>
+  <h1>Camera render diagnostics</h1>
+  <p class="lead">
+    Renders one frame per camera setting so the perspective, depth of field, and
+    horizon behaviour can be eyeballed, then checks the pixels for the properties
+    each control is supposed to produce. Serve the project and open this file,
+    e.g. <code>http://localhost:8000/tests/camera-render.test.html</code>.
+  </p>
+  <div class="grid" id="grid"></div>
+  <div id="checks"></div>
+  <div id="summary"></div>
+
+<script src="shader-harness.js"></script>
+<script>
+"use strict";
+
+const H = window.ShaderHarness;
+const gridEl = document.getElementById("grid");
+const checksEl = document.getElementById("checks");
+const summaryEl = document.getElementById("summary");
+let passed = 0;
+let failed = 0;
+
+function check(name, cond, detail) {
+  const box = document.createElement("div");
+  box.className = "case " + (cond ? "ok" : "fail");
+  box.textContent = `${cond ? "ok  -" : "FAIL -"} ${name}`;
+  if (detail) {
+    const pre = document.createElement("pre");
+    pre.textContent = detail;
+    box.appendChild(pre);
+  }
+  checksEl.appendChild(box);
+  if (cond) passed += 1; else failed += 1;
+}
+
+const W = 300;
+const HGT = 170;
+
+function shoot(label, note, parts, shader) {
+  const card = document.createElement("div");
+  card.className = "shot";
+  const canvas = document.createElement("canvas");
+  canvas.width = W;
+  canvas.height = HGT;
+  card.appendChild(canvas);
+  const cap = document.createElement("div");
+  cap.className = "caption";
+  cap.innerHTML = `<b>${label}</b><span>${note}</span>`;
+  card.appendChild(cap);
+  gridEl.appendChild(card);
+
+  const frame = H.renderFrame(canvas, parts, shader, { time: 8 });
+  if (!frame.ok) check(`render ${label}`, false, frame.log);
+  return frame;
+}
+
+async function run() {
+  let sources;
+  try {
+    sources = await H.loadSources("../app.js");
+  } catch (err) {
+    check("fetch app.js", false, `${err.message}\nServe the folder over HTTP (file:// blocks fetch).`);
+    summaryEl.textContent = "1 failed";
+    return;
+  }
+  const base = sources.shader;
+  const parts = sources.parts;
+  const V = (pairs) => H.withConsts(base, pairs);
+
+  // Baselines
+  const flat = shoot("camera off", "flat screen-space view", parts, base);
+  const topDown = shoot("camera on, tilt 0", "uCam 1, uCamPitch 0", parts,
+    V({ uCam: "1", uCamPitch: "0.0", uCamHaze: "0.0", uCamAperture: "0.0" }));
+  const tilted = shoot("camera on, tilt 45 (default)", "uCam 1", parts, V({ uCam: "1" }));
+  const grazing = shoot("tilt 80 + horizon", "uCamPitch 80, uCamHaze 0.6", parts,
+    V({ uCam: "1", uCamPitch: "80.0", uCamHaze: "0.6" }));
+  const sharp = shoot("tilt 60, aperture 0", "no depth of field", parts,
+    V({ uCam: "1", uCamPitch: "60.0", uCamHaze: "0.0", uCamAperture: "0.0" }));
+  const focusNear = shoot("focus near, aperture 1", "uCamFocus 0.0", parts,
+    V({ uCam: "1", uCamPitch: "60.0", uCamHaze: "0.0", uCamAperture: "1.0", uCamFocus: "0.0", uCamFocusRange: "0.05" }));
+  const focusFar = shoot("focus far, aperture 1", "uCamFocus 1.0", parts,
+    V({ uCam: "1", uCamPitch: "60.0", uCamHaze: "0.0", uCamAperture: "1.0", uCamFocus: "1.0", uCamFocusRange: "0.05" }));
+  const dof = (focus) => V({
+    uCam: "1", uCamPitch: "45.0", uCamHaze: "0.0",
+    uCamAperture: "1.0", uCamFocus: focus, uCamFocusRange: "0.05",
+  });
+  const dofNear = shoot("tilt 45, focus near", "uCamFocus 0.0, aperture 1", parts, dof("0.0"));
+  const dofFar = shoot("tilt 45, focus far", "uCamFocus 1.0, aperture 1", parts, dof("1.0"));
+  const lit = shoot("tilt 55 + 3D relief", "uCam 1, u3D 1", parts,
+    V({ uCam: "1", uCamPitch: "55.0", u3D: "1" }));
+  const orbit = shoot("tilt 45, orbit 90", "uCamYaw 90", parts,
+    V({ uCam: "1", uCamYaw: "90.0" }));
+
+  const frames = {
+    flat, topDown, tilted, grazing, sharp, focusNear, focusFar, dofNear, dofFar, lit, orbit,
+  };
+  const allRendered = Object.keys(frames).every((k) => frames[k].ok);
+  check("every variant rendered without GL errors", allRendered);
+  if (!allRendered) {
+    summaryEl.textContent = `${passed} passed, ${failed} failed`;
+    return;
+  }
+
+  // A frame that is a single flat color means the shader silently produced nothing.
+  for (const key of Object.keys(frames)) {
+    const s = H.bandStats(frames[key], 0, 1);
+    check(`${key}: frame has real structure`, s.sd > 0.01,
+      `mean=${s.mean.toFixed(3)} sd=${s.sd.toFixed(4)}`);
+  }
+
+  // Tilt 0 must reduce to the flat view: uniform detail top and bottom.
+  const tdLow = H.bandDetail(topDown, 0.0, 0.35);
+  const tdHigh = H.bandDetail(topDown, 0.65, 1.0);
+  check("tilt 0 keeps detail uniform (no perspective)",
+    Math.abs(tdLow - tdHigh) < 0.25 * Math.max(tdLow, tdHigh),
+    `bottom=${tdLow.toFixed(4)} top=${tdHigh.toFixed(4)}`);
+
+  // Perspective: the plane recedes upward, so the far band loses detail.
+  const tLow = H.bandDetail(tilted, 0.0, 0.35);
+  const tHigh = H.bandDetail(tilted, 0.65, 1.0);
+  check("tilt 45 compresses detail toward the far band", tHigh < tLow * 0.85,
+    `near(bottom)=${tLow.toFixed(4)} far(top)=${tHigh.toFixed(4)}`);
+
+  // Depth fade pulls the far band toward the haze color (dark by default).
+  const gLow = H.bandStats(grazing, 0.0, 0.3).mean;
+  const gHigh = H.bandStats(grazing, 0.7, 1.0).mean;
+  check("depth fade darkens the far band toward the haze color", gHigh < gLow,
+    `near=${gLow.toFixed(3)} far=${gHigh.toFixed(3)}`);
+
+  // Focus: blur belongs wherever the focal plane is not.
+  const nearBandSharp = H.bandDetail(sharp, 0.0, 0.3);
+  const nearBandFocusNear = H.bandDetail(focusNear, 0.0, 0.3);
+  const nearBandFocusFar = H.bandDetail(focusFar, 0.0, 0.3);
+  check("focusing near keeps the near band as sharp as aperture 0",
+    nearBandFocusNear > nearBandSharp * 0.8,
+    `aperture0=${nearBandSharp.toFixed(4)} focusNear=${nearBandFocusNear.toFixed(4)}`);
+  check("focusing far blurs the near band",
+    nearBandFocusFar < nearBandFocusNear * 0.7,
+    `focusNear=${nearBandFocusNear.toFixed(4)} focusFar=${nearBandFocusFar.toFixed(4)}`);
+
+  // Moving the focal plane must trade sharpness between the two bands. Tilt 45
+  // keeps the far band well above the aliasing floor, so both sides can move.
+  const nearOfDofNear = H.bandDetail(dofNear, 0.0, 0.3);
+  const nearOfDofFar = H.bandDetail(dofFar, 0.0, 0.3);
+  const farOfDofNear = H.bandDetail(dofNear, 0.7, 1.0);
+  const farOfDofFar = H.bandDetail(dofFar, 0.7, 1.0);
+  check("focal plane at the near band favors the near band",
+    nearOfDofNear > nearOfDofFar,
+    `near band: focusNear=${nearOfDofNear.toFixed(4)} focusFar=${nearOfDofFar.toFixed(4)}`);
+  check("focal plane at the far band favors the far band",
+    farOfDofFar > farOfDofNear,
+    `far band: focusNear=${farOfDofNear.toFixed(4)} focusFar=${farOfDofFar.toFixed(4)}`);
+
+  // Orbit must actually rotate the sampled plane, not just re-scale it.
+  let diff = 0;
+  for (let i = 0; i < tilted.pixels.length; i += 4) {
+    diff += Math.abs(tilted.pixels[i] - orbit.pixels[i]);
+  }
+  diff /= (tilted.pixels.length / 4) * 255;
+  check("orbit changes the sampled slice of the field", diff > 0.01,
+    `mean red-channel delta=${diff.toFixed(4)}`);
+
+  summaryEl.className = failed ? "fail" : "ok";
+  summaryEl.textContent = failed ? `${passed} passed, ${failed} failed` : `${passed} passed`;
+}
+
+run();
+</script>
+</body>
+</html>

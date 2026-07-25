@@ -69,9 +69,80 @@ test("3D shading samples a shared height field", () => {
   // Normals from forward differences, lit with Blinn-Phong + fresnel.
   assert.ok(shader.includes("vec2 grad = vec2(hx - h, hy - h) / eps;"));
   assert.ok(shader.includes("normalize(lightDir + viewDir)"));
-  assert.ok(shader.includes("refract(vec3(0.0, 0.0, -1.0), nrm"));
+  // Specular and refraction follow the camera rather than a fixed view axis.
+  assert.ok(shader.includes("refract(-viewDir, nrm"));
+  assert.ok(shader.includes("vec3 shadeSurface(vec3 base, vec3 nrm, float h, vec3 viewDir)"));
   // Whole 3D path sits behind a const branch so it compiles away when off.
   assert.ok(shader.includes("if (u3D != 0) {"));
+});
+
+test("camera uniforms are declared in the controls block", () => {
+  for (const key of [
+    "uCam", "uCamPitch", "uCamYaw", "uCamHeight", "uCamFov",
+    "uCamFocus", "uCamFocusRange", "uCamAperture", "uCamHaze", "uCamHazeColor",
+  ]) {
+    assert.ok(shader.includes(key), `missing ${key}`);
+  }
+});
+
+test("camera projects screen rays onto the noise plane", () => {
+  assert.ok(shader.includes("float planeProject(vec2 sUv, out vec2 planeUv, out vec3 rayDir)"));
+  // Rays above the horizon report a miss instead of a bogus hit behind the eye.
+  assert.ok(shader.includes("if (rayDir.z > -1e-4) return -1.0;"));
+  // Mouse and anchors must be projected into the same space as the surface.
+  assert.ok(shader.includes("vec2 spaceCoord(vec2 sUv)"));
+  assert.ok(shader.includes("return spaceCoord(sUv);"));
+  assert.ok(shader.includes("mUv = spaceCoord(mUv);"));
+  // Whole camera path sits behind a const branch so it compiles away when off.
+  assert.ok(shader.includes("if (uCam != 0) {"));
+  assert.ok(shader.includes("if (uCam == 0) return sUv;"));
+});
+
+test("depth of field and horizon aliasing ride the fBm octave budget", () => {
+  // Blur is a detail cut, not extra taps: fbmLod carries a fractional budget.
+  assert.ok(shader.includes("float fbmLod(vec3 p, float lod)"));
+  assert.ok(shader.includes("float w = clamp(lod - float(i), 0.0, 1.0);"));
+  assert.ok(shader.includes("float fbm(vec3 p) {"));
+  assert.ok(shader.includes("return fbmLod(p, float(uOctaves));"));
+  // Height field and normals take the same budget so they defocus together.
+  assert.ok(shader.includes("float mouseOn, float t, float lod)"));
+  assert.ok(shader.includes("lod = min(mix(lod, 0.65, coc), aliasLod(footprint));"));
+  assert.ok(shader.includes("footprint *= 1.0 + coc * 6.0;"));
+  // Focus distance is normalized against the visible depth range.
+  assert.ok(shader.includes("float viewDepth(float dist)"));
+  assert.ok(shader.includes("depth01 = viewDepth(dist);"));
+});
+
+test("camera params are written to the controls block and parsed back", () => {
+  assert.ok(appSrc.includes("const CAMERA_SLIDER_DEFS = ["));
+  assert.ok(appSrc.includes("lines.push(`const int   uCam = ${p.uCam ? 1 : 0};`)"));
+  assert.ok(appSrc.includes("const vec3  uCamHazeColor = ${formatVec3("));
+  assert.ok(appSrc.includes("const\\s+vec3\\s+uCamHazeColor"));
+  // uCam must not be confused with uCamPitch and friends when parsing.
+  assert.ok(appSrc.includes("/const\\s+int\\s+uCam\\s*=\\s*(\\d+)\\s*;/"));
+  // Presets must carry the camera suite (scalars + haze color).
+  assert.ok(appSrc.includes("...CAMERA_SLIDER_DEFS.map((d) => d.key)"));
+  assert.ok(appSrc.includes("out.hazeColor = params.hazeColor"));
+});
+
+test("camera sliders and shader camera constants are the same set", () => {
+  // A slider with no constant (or the reverse) would silently do nothing.
+  const defsBlock = appSrc.match(/const CAMERA_SLIDER_DEFS = \[([\s\S]*?)\n\];/)[1];
+  const sliderKeys = (defsBlock.match(/key: "(\w+)"/g) || [])
+    .map((s) => s.replace(/key: "|"/g, ""))
+    .sort();
+
+  const block = shader.match(/\/\/ === CONTROLS BEGIN ===([\s\S]*?)\/\/ === CONTROLS END ===/)[1];
+  const declared = (block.match(/const\s+float\s+(uCam\w+)\s*=/g) || [])
+    .map((s) => s.match(/(uCam\w+)/)[1])
+    .sort();
+
+  assert.deepStrictEqual(declared, sliderKeys);
+  // The toggle and haze color are typed separately, so check them by hand.
+  assert.ok(/const\s+int\s+uCam\s*=/.test(block));
+  assert.ok(/const\s+vec3\s+uCamHazeColor\s*=/.test(block));
+  // Every one is written by buildParamsBlock, not just declared in the default.
+  assert.ok(appSrc.includes("for (const def of CAMERA_SLIDER_DEFS) {\n    lines.push("));
 });
 
 test("3D params are written to the controls block and parsed back", () => {
