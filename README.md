@@ -21,7 +21,7 @@ An internet connection is needed on first load for the CodeMirror editor (loaded
 - Compile errors appear in a console strip below the editor with line numbers, and the offending lines are highlighted. The last working shader keeps rendering while you fix errors.
 - Toolbar under the preview: rewind (reset time), play/pause, controls toggle, fullscreen, elapsed time, FPS, and render resolution.
 - **Fullscreen:** Click the fullscreen button (⧎) in the toolbar to hide everything but the rendered shader. Press **Esc** to return to the normal editor view.
-- Use the **Controls** panel (gear icon) to live-tweak noise and color. Each change rewrites the `// === CONTROLS BEGIN ===` block in the editor and recompiles immediately.
+- Use the **Controls** panel (gear icon) to live-tweak noise and color. Each change rewrites the `// === CONTROLS BEGIN ===` block in the editor and recompiles immediately. The panel is grouped into collapsible sections — Presets, Noise, 3D & Lighting, Camera, Mouse & Anchors, Color — and each collapsed header shows a live summary of what is active inside (for example `Camera · sphere`). Which sections you keep open persists across visits.
 - **Dynamic speed:** Under Noise, toggle it on to drive the animation rate from pointer velocity instead of the Speed slider — 0 when the pointer is still, up to 2 when it moves quickly (mouse or finger drag).
 - **3D & Lighting:** Toggle **3D relief** to treat the noise as a heightfield. Surface normals come from finite differences of that field and are lit with a Blinn-Phong model:
   - *Relief* — height exaggeration (how steep the surface reads).
@@ -35,16 +35,25 @@ An internet connection is needed on first load for the CodeMirror editor (loaded
   - *Light color* — tint applied to the diffuse, specular, and rim terms.
 
   3D shading resamples the height field two extra times per pixel (three with Refraction), so it costs several extra fBm evaluations. Because the controls are `const`, the entire 3D path compiles away while the toggle is off. Watch the FPS readout if you raise Octaves alongside it.
-- **Camera:** Toggle **Perspective** to stop sampling the noise in screen space and instead cast a ray per pixel at the noise plane, so the field recedes into the distance like ground:
-  - *Tilt* — viewing angle, from 0° (straight down, identical to the flat view) to 88° (grazing the horizon). Past `tilt + half the field of view > 90°` the horizon enters frame and the sky above it fills with the haze color.
-  - *Orbit* — rotates the plane under the camera.
-  - *Elevation* — how high the camera sits, which sets how much ground is in frame. The center of the screen always stays on the origin, so Tilt and Orbit pivot around it rather than drifting.
+- **Camera:** Toggle **Perspective** to stop sampling the noise in screen space and instead cast a ray per pixel at a surface, so the field has real depth:
+  - *Geometry* — **Plane** (ground receding to a horizon), **Sphere** (a planet), or **Tunnel** (the inside of a tube). Because the noise is already 3D, the sphere and tunnel are sampled in the volume at each surface point rather than texture-mapped, so the pattern has no seams and no polar pinching.
   - *Field of view* — wide angles exaggerate the perspective, narrow ones flatten it toward an orthographic look.
-  - *Focus distance / Focus range* — where the sharp band sits and how deep it is, measured 0 (nearest visible) to 1 (farthest visible). The mapping is normalized to what is actually on screen, so the same setting means the same thing at every tilt.
+  - *Focus distance / Focus range* — where the sharp band sits and how deep it is, measured 0 (nearest visible) to 1 (farthest visible). The mapping is normalized to what is actually on screen, so the same setting means the same thing at every tilt and in every geometry.
   - *Aperture* — how much detail defocused depths lose. Blur here is a low-pass on the fractal rather than a multi-tap gather: out-of-focus pixels drop fBm octaves, so it costs nothing extra to render. It softens texture and relief convincingly, but it will not produce bokeh highlights.
-  - *Depth fade / Haze color* — blends distance into an atmospheric color, which also fills the sky above the horizon. Defaults to the panel background so the field dissolves into the page.
+  - *Depth fade / Haze color* — blends distance into an atmospheric color, which also fills the sky wherever a ray misses the surface. Defaults to the panel background so the field dissolves into the page.
+  - *Spin / travel* — spins the sphere like a planet, or flies you along the tunnel. It scales with Speed, so Speed 0 stops everything. On the plane it does nothing.
 
-  Mouse effects and anchors are projected onto the plane too, so a brush lands where you point and stretches with perspective as it recedes. Distance also drives an automatic detail limit: pixels covering more ground drop octaves, which keeps the horizon from shimmering (and makes deep tilts cheaper, not costlier).
+  The three aiming sliders are reinterpreted per geometry, and the panel relabels them to match:
+
+  | | Plane | Sphere | Tunnel |
+  | --- | --- | --- | --- |
+  | first | *Tilt* — 0° straight down (identical to the flat view) to 88° grazing the horizon | *View latitude* — 0° at the equator to 88° over the pole | *Look off-axis* — 0° straight down the tube, higher swings toward the wall |
+  | second | *Orbit* — rotates the plane under the camera | *Longitude* — orbits around the globe | *Roll* — rotates around the tube axis |
+  | third | *Elevation* — camera height, which sets how much ground is in frame | *Distance* — how far out the orbit sits | *Tube radius* — how wide the tube is, and so how much pattern wraps around you |
+
+  Everything downstream works off the surface hit rather than the screen, so it all carries over: mouse and anchor brushes land where you point (wrapping correctly across the sphere's date line and around the tunnel), relief and lighting use the surface's own tangent frame so a lit sphere gets a day/night terminator, and depth of field measures from the geometry's own near and far limits. Distance drives an automatic detail limit as well: pixels covering more surface drop octaves, which keeps the horizon and the tunnel's vanishing point from shimmering, and makes deep views cheaper rather than costlier.
+
+  One honest limitation: relief shades the surface without displacing it, so a sphere's silhouette stays a clean circle no matter how high Relief goes. It reads as a cloud-covered world rather than a cratered moon.
 - **Mouse interactions:** In Controls → Mouse, set Hover interact to Ripple, Swirl, Magnify, Paint, or Pinch, then move over the preview. Adjust radius, blur (edge softness), and strength. Lag style (None / Smooth / Sine / Elastic) trails the effect behind the cursor — raise Lag amount for a heavier follow.
 - **Anchors:** Under Mouse → Anchors, add up to 3 fixed pseudo-mouse effects that run alongside the live cursor. Each has its own mode, X/Y, radius, blur, and strength. Use **Place** then click the preview to set position (or drag the X/Y sliders).
 - **Presets:** At the top of the Controls panel, name the current configuration and click **Save** to store it (noise, mouse, color, gradient stops, and anchors — all of it). Saved presets are listed below; click a name to load it or the **×** to delete it. Presets persist in your browser via `localStorage`.
@@ -81,7 +90,9 @@ The preloaded shader implements classic 3D gradient (Perlin) noise with a permut
 
 Noise, interactions, and tone mapping are factored into `heightField()`, which is the single source of truth for the surface. `surfaceNormal()` samples it at neighboring points to build normals, and `shadeSurface()` lights them — so mouse effects and anchors automatically show up in the 3D relief.
 
-With the camera on, `planeProject()` turns each pixel into a ray and intersects the plane `z = 0`, whose `xy` is the noise domain; `spaceCoord()` puts the mouse and anchors through the same mapping. Both the octave budget passed to `fbmLod()` and the differencing step used for normals scale with `pixelFootprint()`, which is how depth of field and horizon anti-aliasing are expressed without extra samples.
+With the camera on, `traceGeometry()` turns each pixel into a ray and intersects the active geometry, and the hit becomes a pair of surface coordinates: position on the plane, longitude/latitude on the sphere, or arc length and depth in the tunnel. `geomPoint()` maps those coordinates into the 3D point the noise is sampled at (which is where spin and travel ride), `surfaceFrame()` supplies the normal, tangents, and metric that let one gradient calculation light every geometry, and `spaceCoord()` puts the mouse and anchors through the same trace. Adding a geometry means adding an intersection, a frame, and a sample mapping — nothing downstream of `heightField()` changes.
+
+Both the octave budget passed to `fbmLod()` and the differencing step used for normals scale with `pixelFootprint()`, which is how depth of field and distance anti-aliasing are expressed without extra samples. The budget is allowed to reach zero octaves, so at a horizon or a vanishing point — where one pixel can span more than the base wavelength — the field resolves to its own average instead of aliasing.
 
 ## Tests
 
@@ -94,7 +105,7 @@ Both run in plain Node and check the gradient math plus the structure of the def
 
 Two browser pages cover what Node cannot. Serve the folder, then open:
 
-- `tests/shader-compile.test.html` — builds the shader against live WebGL2 and WebGL1 contexts across a dozen control combinations (3D, refraction, camera tilts, depth of field, gradient mode, interactions) and prints any driver logs.
-- `tests/camera-render.test.html` — renders a frame per camera setting so the perspective, focus, and horizon can be eyeballed side by side, then checks the pixels for the properties each control should produce (tilt 0 stays flat, perspective compresses detail with distance, moving the focal plane trades sharpness between near and far, depth fade darkens the distance, orbit changes the sampled slice).
+- `tests/shader-compile.test.html` — builds the shader against live WebGL2 and WebGL1 contexts across a dozen control combinations (3D, refraction, camera tilts, depth of field, all three geometries, gradient mode, interactions) and prints any driver logs.
+- `tests/camera-render.test.html` — renders a frame per camera and geometry setting so they can be eyeballed side by side, then checks the pixels for the properties each control should produce: tilt 0 stays flat, perspective compresses detail with distance, moving the focal plane trades sharpness between near and far, depth fade darkens the distance, orbit changes the sampled slice, the sphere leaves sky in the corners and shades unevenly across a terminator, and the tunnel's detail collapses at the vanishing point while travel (and only travel) moves its wall.
 
-Both share `tests/shader-harness.js`, which pulls the shader sources straight out of `app.js` and rewrites control constants the way the Controls panel does.
+Both share `tests/shader-harness.js`, which pulls the shader sources straight out of `app.js` and rewrites control constants the way the Controls panel does. It renders every variant through one shared WebGL context, since browsers keep only about 16 alive and silently drop the oldest.

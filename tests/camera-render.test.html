@@ -66,7 +66,7 @@ function check(name, cond, detail) {
 const W = 300;
 const HGT = 170;
 
-function shoot(label, note, parts, shader) {
+function shoot(label, note, parts, shader, opts) {
   const card = document.createElement("div");
   card.className = "shot";
   const canvas = document.createElement("canvas");
@@ -79,9 +79,16 @@ function shoot(label, note, parts, shader) {
   card.appendChild(cap);
   gridEl.appendChild(card);
 
-  const frame = H.renderFrame(canvas, parts, shader, { time: 8 });
+  const frame = H.renderFrame(parts, shader,
+    Object.assign({ time: 8, target: canvas }, opts || {}));
   if (!frame.ok) check(`render ${label}`, false, frame.log);
   return frame;
+}
+
+/** Render without adding a thumbnail, for A/B comparisons. */
+function renderOnly(parts, shader, opts) {
+  return H.renderFrame(parts, shader,
+    Object.assign({ time: 8, width: W, height: HGT }, opts || {}));
 }
 
 async function run() {
@@ -121,8 +128,20 @@ async function run() {
   const orbit = shoot("tilt 45, orbit 90", "uCamYaw 90", parts,
     V({ uCam: "1", uCamYaw: "90.0" }));
 
+  // Sphere and tunnel geometries
+  const sphere = shoot("sphere", "uGeom 1", parts, V({ uCam: "1", uGeom: "1" }));
+  const sphereLit = shoot("sphere + 3D relief", "uGeom 1, u3D 1", parts,
+    V({ uCam: "1", uGeom: "1", u3D: "1" }));
+  const spherePole = shoot("sphere from the pole", "uGeom 1, latitude 85", parts,
+    V({ uCam: "1", uGeom: "1", uCamPitch: "85.0" }));
+  const tunnel = shoot("tunnel", "uGeom 2, looking down the axis", parts,
+    V({ uCam: "1", uGeom: "2", uCamPitch: "0.0", uCamHaze: "0.0", uCamAperture: "0.0" }));
+  const tunnelLit = shoot("tunnel + 3D relief + depth fade", "uGeom 2, u3D 1", parts,
+    V({ uCam: "1", uGeom: "2", uCamPitch: "0.0", u3D: "1" }));
+
   const frames = {
     flat, topDown, tilted, grazing, sharp, focusNear, focusFar, dofNear, dofFar, lit, orbit,
+    sphere, sphereLit, spherePole, tunnel, tunnelLit,
   };
   const allRendered = Object.keys(frames).every((k) => frames[k].ok);
   check("every variant rendered without GL errors", allRendered);
@@ -182,13 +201,61 @@ async function run() {
     `far band: focusNear=${farOfDofNear.toFixed(4)} focusFar=${farOfDofFar.toFixed(4)}`);
 
   // Orbit must actually rotate the sampled plane, not just re-scale it.
-  let diff = 0;
-  for (let i = 0; i < tilted.pixels.length; i += 4) {
-    diff += Math.abs(tilted.pixels[i] - orbit.pixels[i]);
-  }
-  diff /= (tilted.pixels.length / 4) * 255;
-  check("orbit changes the sampled slice of the field", diff > 0.01,
-    `mean red-channel delta=${diff.toFixed(4)}`);
+  const orbitDelta = H.frameDelta(tilted, orbit);
+  check("orbit changes the sampled slice of the field", orbitDelta > 0.01,
+    `frame delta=${orbitDelta.toFixed(4)}`);
+
+  // --- Sphere ---
+  // The planet should sit in the middle with empty space around it. The haze
+  // color doubles as the sky, so corners must match it and the middle must not.
+  const haze = H.pixelAt(sphere, 0.02, 0.04);
+  const middle = H.pixelAt(sphere, 0.5, 0.5);
+  const sameAsHaze = (px) => Math.abs(px[0] - haze[0]) + Math.abs(px[1] - haze[1])
+    + Math.abs(px[2] - haze[2]) < 12;
+  check("sphere leaves background sky in all four corners",
+    sameAsHaze(H.pixelAt(sphere, 0.02, 0.96)) && sameAsHaze(H.pixelAt(sphere, 0.98, 0.04))
+      && sameAsHaze(H.pixelAt(sphere, 0.98, 0.96)),
+    `corner=${haze.join(",")}`);
+  check("sphere fills the middle of the frame", !sameAsHaze(middle),
+    `middle=${middle.join(",")} sky=${haze.join(",")}`);
+
+  // Bump-mapped relief has to produce a light/dark gradient across the globe.
+  const quadrant = (x0, y0) => H.rectStats(sphereLit,
+    { x0, x1: x0 + 0.2, y0, y1: y0 + 0.2 }).mean;
+  const quads = [quadrant(0.3, 0.3), quadrant(0.5, 0.3), quadrant(0.3, 0.5), quadrant(0.5, 0.5)];
+  const spread = Math.max.apply(null, quads) - Math.min.apply(null, quads);
+  check("lit sphere shades unevenly (a terminator exists)", spread > 0.04,
+    `quadrant means=${quads.map((q) => q.toFixed(3)).join(", ")}`);
+
+  // Viewing from the pole must show a different slice than the equator view.
+  // Measured across the globe itself, since the sky around it never changes.
+  const disc = { x0: 0.3, x1: 0.7, y0: 0.3, y1: 0.7 };
+  const poleDelta = H.frameDelta(sphere, spherePole, disc);
+  check("sphere view latitude changes what is visible", poleDelta > 0.02,
+    `delta across the globe=${poleDelta.toFixed(4)}`);
+
+  // --- Tunnel ---
+  // Looking down the axis, the wall recedes to a vanishing point in the middle,
+  // so detail collapses there while the near wall at the edges stays sharp.
+  const tunnelCenter = H.rectDetail(tunnel, { x0: 0.42, x1: 0.58, y0: 0.42, y1: 0.58 });
+  const tunnelEdge = H.rectDetail(tunnel, { x0: 0.0, x1: 0.12 });
+  check("tunnel detail collapses toward the vanishing point",
+    tunnelCenter < tunnelEdge * 0.6,
+    `center=${tunnelCenter.toFixed(4)} edge=${tunnelEdge.toFixed(4)}`);
+
+  // Travel is the tunnel's only geometric time input. With the animated domain
+  // warp and color cycle switched off, zeroing it must freeze the frame.
+  const still = { uCam: "1", uGeom: "2", uCamPitch: "0.0", uWarp: "0.0", uColorCycle: "0.0" };
+  const tunnelStill = V(Object.assign({ uGeomMotion: "0.0" }, still));
+  const tunnelMoving = V(Object.assign({ uGeomMotion: "1.0" }, still));
+  const stillDelta = H.frameDelta(renderOnly(parts, tunnelStill, { time: 8 }),
+    renderOnly(parts, tunnelStill, { time: 12 }));
+  const movingDelta = H.frameDelta(renderOnly(parts, tunnelMoving, { time: 8 }),
+    renderOnly(parts, tunnelMoving, { time: 12 }));
+  check("tunnel with travel 0 is frozen in time", stillDelta < 0.001,
+    `delta over 4s=${stillDelta.toFixed(5)}`);
+  check("tunnel travel moves the wall past the camera", movingDelta > 0.02,
+    `delta over 4s=${movingDelta.toFixed(4)}`);
 
   summaryEl.className = failed ? "fail" : "ok";
   summaryEl.textContent = failed ? `${passed} passed, ${failed} failed` : `${passed} passed`;

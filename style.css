@@ -351,7 +351,7 @@ body.fullscreen .fullscreen-hint.show {
   padding: 10px 14px 14px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 4px;
 }
 
 .param-row {
@@ -467,21 +467,86 @@ body.fullscreen .fullscreen-hint.show {
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--text-dim);
-  margin-top: 4px;
-  padding-top: 8px;
-  border-top: 1px solid var(--border);
-}
-
-.param-section-title:first-child {
-  margin-top: 0;
-  padding-top: 0;
-  border-top: none;
 }
 
 .param-section {
   display: flex;
   flex-direction: column;
+}
+
+/* Collapsible section header: chevron, name, and a live state summary */
+.param-section-header {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  width: 100%;
+  padding: 9px 0 7px;
+  margin: 0;
+  background: none;
+  border: none;
+  border-top: 1px solid var(--border);
+  cursor: pointer;
+  text-align: left;
+  font-family: var(--font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.param-section:first-child .param-section-header {
+  border-top: none;
+  padding-top: 2px;
+}
+
+.param-section-header:hover .section-name,
+.param-section-header:focus-visible .section-name {
+  color: var(--text);
+}
+
+.param-section-header:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.section-chevron {
+  display: inline-block;
+  font-size: 9px;
+  transition: transform 0.15s ease;
+  transform-origin: 40% 50%;
+}
+
+.param-section:not(.collapsed) .section-chevron {
+  transform: rotate(90deg);
+}
+
+.section-summary {
+  margin-left: auto;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  text-transform: none;
+  color: var(--accent-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 55%;
+}
+
+.param-section:not(.collapsed) .section-summary {
+  color: var(--text-dim);
+}
+
+.param-section-body {
+  display: flex;
+  flex-direction: column;
   gap: 14px;
+  padding: 8px 0 10px;
+}
+
+.param-section.collapsed .param-section-body {
+  display: none;
 }
 
 .param-hint {
@@ -899,8 +964,14 @@ body.fullscreen .fullscreen-hint.show {
 
   .params-list {
     padding: 10px 16px calc(18px + env(safe-area-inset-bottom));
-    gap: 16px;
+    gap: 4px;
     -webkit-overflow-scrolling: touch;
+  }
+
+  /* Bigger tap targets for the section headers on touch screens */
+  .param-section-header {
+    padding: 13px 0 11px;
+    font-size: 12px;
   }
 
   .param-row input[type="range"] {

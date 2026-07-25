@@ -66,6 +66,7 @@ const float u3DRefract = 0.00;
 const float u3DShadow = 0.35;
 const vec3  u3DLightColor = vec3(1.000, 0.965, 0.910);
 const int   uCam = 0;
+const int   uGeom = 0;
 const float uCamPitch = 45.00;
 const float uCamYaw = 0.00;
 const float uCamHeight = 1.00;
@@ -74,6 +75,7 @@ const float uCamFocus = 0.30;
 const float uCamFocusRange = 0.12;
 const float uCamAperture = 0.40;
 const float uCamHaze = 0.35;
+const float uGeomMotion = 0.15;
 const vec3  uCamHazeColor = vec3(0.063, 0.082, 0.110);
 const int   uColorMode = 0;
 const float uHue = 0.00;
@@ -143,61 +145,217 @@ float fbm(vec3 p) {
     return fbmLod(p, float(uOctaves));
 }
 
-/* ---------- Camera: screen ray onto the noise plane ----------
-   With the camera off, sampling happens directly in screen space (uv). With it
-   on, every screen pixel is a ray cast at the plane z = 0, whose xy is the
-   noise domain — so tilting the camera views the field in perspective. */
+/* ---------- Camera + geometry: where the noise lives ----------
+   With the camera off, the noise is sampled directly in screen space. With it
+   on, every pixel becomes a ray cast at the active geometry, and the hit gives
+   a pair of surface coordinates that everything downstream samples in:
+     Plane  — s = position on the plane z = 0
+     Sphere — s = (longitude, latitude) on a unit sphere at the origin
+     Tunnel — s = (arc length, depth) inside a cylinder around the z axis
+   The noise itself is 3D, so the sphere and tunnel are sampled in the volume
+   rather than texture-mapped: no seams, no polar pinching in the pattern. */
+
+const float TAU = 6.28318530718;
 
 float camFocal() {
     return 1.0 / tan(radians(clamp(uCamFov, 10.0, 140.0)) * 0.5);
 }
 
-// Returns the hit distance along the ray, or -1.0 when the ray passes above the
-// horizon. planeUv is the noise-domain coordinate, rayDir is kept for shading.
-float planeProject(vec2 sUv, out vec2 planeUv, out vec3 rayDir) {
-    float aspect = iResolution.x / iResolution.y;
-    vec2 centered = (sUv - 0.5 * vec2(aspect, 1.0)) * 2.0;
+float tunnelRadius() {
+    return max(uCamHeight, 0.05);
+}
+
+// The sphere is unit-radius, so Elevation reads as height above its surface.
+// The offset leaves the default framing with space around the planet.
+float sphereCamDist() {
+    return 1.6 + max(uCamHeight, 0.05);
+}
+
+// Right/up from a forward direction and an up reference
+void basisFrom(vec3 fwd, vec3 upRef, out vec3 right, out vec3 up) {
+    right = normalize(cross(fwd, upRef));
+    up = cross(right, fwd);
+}
+
+// Camera position and basis. Tilt / Orbit / Elevation are reinterpreted:
+//   Plane  — pitch down from vertical / spin the field / height above it
+//   Sphere — latitude of the orbit / longitude / distance from the surface
+//   Tunnel — swing away from the axis / roll around it / radius of the tube
+void cameraSetup(out vec3 ro, out vec3 fwd, out vec3 right, out vec3 up) {
+    if (uGeom == 1) {
+        float lat = radians(clamp(uCamPitch, 0.0, 88.0));
+        float lon = radians(uCamYaw);
+        vec3 dir = vec3(cos(lat) * cos(lon), cos(lat) * sin(lon), sin(lat));
+        ro = dir * sphereCamDist();
+        fwd = -dir;
+        basisFrom(fwd, vec3(0.0, 0.0, 1.0), right, up);
+        return;
+    }
+    if (uGeom == 2) {
+        float swing = radians(clamp(uCamPitch, 0.0, 88.0));
+        vec3 aimFwd = vec3(sin(swing), 0.0, cos(swing));
+        vec3 aimRight, aimUp;
+        basisFrom(aimFwd, vec3(0.0, 1.0, 0.0), aimRight, aimUp);
+
+        // Roll the whole basis around the tube axis
+        float roll = radians(uCamYaw);
+        float cr = cos(roll);
+        float sr = sin(roll);
+        fwd   = vec3(cr * aimFwd.x - sr * aimFwd.y, sr * aimFwd.x + cr * aimFwd.y, aimFwd.z);
+        right = vec3(cr * aimRight.x - sr * aimRight.y, sr * aimRight.x + cr * aimRight.y, aimRight.z);
+        up    = vec3(cr * aimUp.x - sr * aimUp.y, sr * aimUp.x + cr * aimUp.y, aimUp.z);
+        ro = vec3(0.0);   // on the axis, which hitTunnel relies on
+        return;
+    }
 
     // Pitch 0 looks straight down (matches the flat view); 88 grazes the horizon
     float elev = radians(90.0 - clamp(uCamPitch, 0.0, 88.0));
     float sinE = sin(elev);
     float cosE = cos(elev);
-    vec3 fwd   = vec3(0.0, cosE, -sinE);
-    vec3 right = vec3(1.0, 0.0, 0.0);
-    vec3 up    = vec3(0.0, sinE, cosE);
-
     float h = max(uCamHeight, 0.05);
+    // Spelled out rather than crossed: at pitch 0 the view axis is parallel to
+    // world up, where deriving right/up from a cross product is singular.
+    fwd   = vec3(0.0, cosE, -sinE);
+    right = vec3(1.0, 0.0, 0.0);
+    up    = vec3(0.0, sinE, cosE);
     // Pull the camera back so the center ray always lands on the origin
-    vec3 ro = vec3(0.0, -h * cosE / max(sinE, 1e-3), h);
-    rayDir = normalize(fwd * camFocal() + right * centered.x + up * centered.y);
+    ro = vec3(0.0, -h * cosE / max(sinE, 1e-3), h);
+}
 
-    planeUv = vec2(0.0);
-    if (rayDir.z > -1e-4) return -1.0;
+// Plane z = 0. Orbit spins the field under the camera rather than moving it.
+float hitPlane(vec3 ro, vec3 rd, out vec2 s) {
+    s = vec2(0.0);
+    if (rd.z > -1e-4) return -1.0;   // above the horizon
 
-    float dist = -ro.z / rayDir.z;
-    vec2 hit = ro.xy + dist * rayDir.xy;
-
+    float dist = -ro.z / rd.z;
+    vec2 hit = ro.xy + dist * rd.xy;
     float yaw = radians(uCamYaw);
     float cosY = cos(yaw);
     float sinY = sin(yaw);
-    planeUv = vec2(cosY * hit.x - sinY * hit.y, sinY * hit.x + cosY * hit.y);
+    s = vec2(cosY * hit.x - sinY * hit.y, sinY * hit.x + cosY * hit.y);
     return dist;
 }
 
-// Screen point -> sampling space, for the mouse and anchors. Points above the
-// horizon are pushed far away so their brushes simply have no reach.
-vec2 spaceCoord(vec2 sUv) {
-    if (uCam == 0) return sUv;
-    vec2 planeUv;
-    vec3 rayDir;
-    if (planeProject(sUv, planeUv, rayDir) < 0.0) return vec2(1e4);
-    return planeUv;
+// Unit sphere at the origin, near side only
+float hitSphere(vec3 ro, vec3 rd, out vec2 s) {
+    s = vec2(0.0);
+    float b = dot(ro, rd);
+    float disc = b * b - (dot(ro, ro) - 1.0);
+    if (disc < 0.0) return -1.0;
+
+    float dist = -b - sqrt(disc);
+    if (dist <= 0.0) return -1.0;
+    vec3 hit = ro + dist * rd;
+    s = vec2(atan(hit.y, hit.x), asin(clamp(hit.z, -1.0, 1.0)));
+    return dist;
 }
 
-// Plane-space width of one pixel: grows with distance, which is what keeps
-// normals and fine octaves from shimmering as the surface recedes.
-float pixelFootprint(float dist, vec3 rayDir) {
-    return dist * (2.0 / (camFocal() * max(iResolution.y, 1.0))) / max(-rayDir.z, 0.02);
+// Cylinder around the z axis, seen from the inside. The camera sits on the
+// axis, which reduces the intersection to a single divide.
+float hitTunnel(vec3 rd, out vec2 s) {
+    s = vec2(0.0);
+    float side = length(rd.xy);
+    if (side < 1e-4) return -1.0;   // straight down the axis, never meets a wall
+
+    float R = tunnelRadius();
+    float dist = R / side;
+    vec3 hit = dist * rd;
+    // Cap the axial reach: past this the wall is sub-pixel anyway, and the
+    // noise coordinate would grow large enough to lose float precision.
+    s = vec2(atan(hit.y, hit.x) * R, clamp(hit.z, -150.0 * R, 150.0 * R));
+    return dist;
+}
+
+// Cast the pixel ray at the active geometry. Returns the hit distance along the
+// ray, or -1.0 on a miss. rayDir is kept for view-dependent shading.
+float traceGeometry(vec2 sUv, out vec2 s, out vec3 rayDir) {
+    vec3 ro, fwd, right, up;
+    cameraSetup(ro, fwd, right, up);
+
+    float aspect = iResolution.x / iResolution.y;
+    vec2 centered = (sUv - 0.5 * vec2(aspect, 1.0)) * 2.0;
+    rayDir = normalize(fwd * camFocal() + right * centered.x + up * centered.y);
+
+    if (uGeom == 1) return hitSphere(ro, rayDir, s);
+    if (uGeom == 2) return hitTunnel(rayDir, s);
+    return hitPlane(ro, rayDir, s);
+}
+
+// Screen point -> sampling space, for the mouse and anchors. Missed rays are
+// pushed far away so their brushes simply have no reach.
+vec2 spaceCoord(vec2 sUv) {
+    if (uCam == 0) return sUv;
+    vec2 s;
+    vec3 rayDir;
+    if (traceGeometry(sUv, s, rayDir) < 0.0) return vec2(1e4);
+    return s;
+}
+
+// Sphere longitude and tunnel circumference wrap, so a brush center has to be
+// brought into the same lap as the pixel or it gets cut in half at the seam.
+// Only x wraps, which keeps the vec2(1e4) miss sentinel out of reach.
+vec2 alignSeam(vec2 center, vec2 ref) {
+    if (uCam == 0) return center;
+    float period = 0.0;
+    if (uGeom == 1) period = TAU;
+    if (uGeom == 2) period = TAU * tunnelRadius();
+    if (period <= 0.0) return center;
+    center.x += period * floor((ref.x - center.x) / period + 0.5);
+    return center;
+}
+
+// Surface tangent frame at s, plus the world distance one unit of s.x / s.y
+// covers (the metric), which keeps step sizes and relief consistent.
+void surfaceFrame(vec2 s, out vec3 nrm, out vec3 tanX, out vec3 tanY, out vec2 metric) {
+    if (uGeom == 1) {
+        float lat = clamp(s.y, -1.5707, 1.5707);
+        float cosL = cos(lat);
+        float sinL = sin(lat);
+        nrm  = vec3(cosL * cos(s.x), cosL * sin(s.x), sinL);
+        tanX = vec3(-sin(s.x), cos(s.x), 0.0);
+        tanY = vec3(-sinL * cos(s.x), -sinL * sin(s.x), cosL);
+        metric = vec2(max(cosL, 0.02), 1.0);
+        return;
+    }
+    if (uGeom == 2) {
+        float a = s.x / tunnelRadius();
+        nrm  = vec3(-cos(a), -sin(a), 0.0);   // walls face the axis
+        tanX = vec3(-sin(a), cos(a), 0.0);
+        tanY = vec3(0.0, 0.0, 1.0);
+        metric = vec2(1.0, 1.0);
+        return;
+    }
+    nrm  = vec3(0.0, 0.0, 1.0);
+    tanX = vec3(1.0, 0.0, 0.0);
+    tanY = vec3(0.0, 1.0, 0.0);
+    metric = vec2(1.0, 1.0);
+}
+
+// Surface coordinates -> the 3D point the noise is sampled at. Spin and travel
+// ride here, so the pattern moves while brushes stay put on screen.
+vec3 geomPoint(vec2 s, float t) {
+    if (uGeom == 1) {
+        float lon = s.x + t * uGeomMotion;
+        float lat = clamp(s.y, -1.5707, 1.5707);
+        float cosL = cos(lat);
+        vec3 dir = vec3(cosL * cos(lon), cosL * sin(lon), sin(lat));
+        return dir * uScale + vec3(0.0, 0.0, t);
+    }
+    if (uGeom == 2) {
+        float R = tunnelRadius();
+        float a = s.x / R;
+        return vec3(cos(a), sin(a), 0.0) * R * uScale
+             + vec3(0.0, 0.0, (s.y + t * uGeomMotion) * uScale);
+    }
+    return vec3(s * uScale, t);
+}
+
+// World width of one pixel on the surface: grows with distance and with
+// grazing angles, which is what keeps normals and fine octaves from
+// shimmering as the surface recedes.
+float pixelFootprint(float dist, vec3 rayDir, vec3 geomNrm) {
+    float grazing = max(-dot(rayDir, geomNrm), 0.02);
+    return dist * (2.0 / (camFocal() * max(iResolution.y, 1.0))) / grazing;
 }
 
 // Hyperbolic depth curve: compresses distance the way perspective does
@@ -206,8 +364,7 @@ float depthCurve(float dist) {
 }
 
 // Distance to the plane down the screen's center column (cy: -1 bottom, +1 top).
-// Used to normalize depth against what is actually visible, so Focus distance
-// means the same thing at every tilt. Negative when that ray sees only sky.
+// Negative when that ray sees only sky.
 float columnDist(float cy) {
     float elev = radians(90.0 - clamp(uCamPitch, 0.0, 88.0));
     float sinE = sin(elev);
@@ -218,13 +375,31 @@ float columnDist(float cy) {
     return max(uCamHeight, 0.05) / -rd.z;
 }
 
+// Nearest and farthest distance the geometry can show, so Focus distance can
+// mean the same thing at every tilt. farD < 0 means "effectively infinite".
+void depthRange(out float nearD, out float farD) {
+    if (uGeom == 1) {
+        float d = sphereCamDist();
+        nearD = max(d - 1.0, 0.02);
+        farD = sqrt(max(d * d - 1.0, 1e-4));   // the limb
+        return;
+    }
+    if (uGeom == 2) {
+        nearD = tunnelRadius();
+        farD = -1.0;                           // the tube recedes forever
+        return;
+    }
+    nearD = columnDist(-1.0);
+    farD = columnDist(1.0);
+}
+
 // 0 at the nearest visible depth, 1 at the farthest. Falls back to the raw
-// curve when the view is near top-down and has no meaningful depth spread.
+// curve when the view has no meaningful depth spread (near top-down).
 float viewDepth(float dist) {
-    float nearD = columnDist(-1.0);
-    float farD = columnDist(1.0);
+    float nearD, farD;
+    depthRange(nearD, farD);
     if (nearD < 0.0) return depthCurve(dist);
-    if (farD < 0.0) farD = nearD * 60.0;   // horizon in frame: effectively infinite
+    if (farD < 0.0) farD = nearD * 60.0;
 
     float nearC = depthCurve(nearD);
     float spread = depthCurve(farD) - nearC;
@@ -232,10 +407,12 @@ float viewDepth(float dist) {
     return clamp((depthCurve(dist) - nearC) / spread, 0.0, 1.0);
 }
 
-// Highest octave count that still resolves inside one pixel footprint
+// Highest octave count that still resolves inside one pixel footprint. Reaching
+// 0 is allowed and matters: at a vanishing point one pixel can span more than
+// the base wavelength, and anything left there is pure aliasing.
 float aliasLod(float footprint) {
     float lanes = 1.0 / max(footprint * uScale * 2.0, 1e-5);
-    return log2(max(lanes, 2.0)) / log2(max(uLacunarity, 1.05));
+    return max(log2(max(lanes, 1.0)) / log2(max(uLacunarity, 1.05)), 0.0);
 }
 
 // Circle of confusion: 0 in the focal band, rising to 1 at the depth extremes
@@ -319,6 +496,7 @@ float interactFalloff(vec2 uv0, vec2 center, float radius, float blurAmt, float 
 // Domain modes (1–3) warp uv before fBm. Distances use original uv0.
 void applyInteractDomain(inout vec2 uv, vec2 uv0, vec2 center, int mode, float radius, float blurAmt, float strength, float activeAmt) {
     if (mode < 1 || mode > 3 || activeAmt < 0.5) return;
+    center = alignSeam(center, uv0);
     float falloff = interactFalloff(uv0, center, radius, blurAmt, activeAmt);
     float md = length(uv0 - center);
     if (mode == 1) {
@@ -339,7 +517,7 @@ void applyInteractDomain(inout vec2 uv, vec2 uv0, vec2 center, int mode, float r
 // Value modes (4–5) sculpt v after fBm.
 void applyInteractValue(inout float v, vec2 uv0, vec2 center, int mode, float radius, float blurAmt, float strength, float activeAmt) {
     if (mode < 4 || activeAmt < 0.5) return;
-    float falloff = interactFalloff(uv0, center, radius, blurAmt, activeAmt);
+    float falloff = interactFalloff(uv0, alignSeam(center, uv0), radius, blurAmt, activeAmt);
     if (mode == 4) {
         v += falloff * strength;
     } else if (mode == 5) {
@@ -358,12 +536,13 @@ vec2 anchorUv(int i) {
 }
 
 // --- Height field: warped fBm + value interactions + tone, in [0, 1] ---
-// uvW is the domain-warped coordinate; uv0 stays unwarped so brush falloffs
-// keep their position. 3D mode resamples this at neighboring points, and lod
-// trims fine octaves for defocus / distance.
+// uvW is the domain-warped surface coordinate; uv0 stays unwarped so brush
+// falloffs keep their position. geomPoint turns it into the 3D noise sample
+// point for the active geometry. 3D mode resamples this at neighboring points,
+// and lod trims fine octaves for defocus / distance.
 float heightField(vec2 uvW, vec2 uv0, vec2 mUv, float mouseOn, float t, float lod) {
     // Domain-warped fBm: fbm(p + fbm(p)) for extra swirl
-    vec3 p = vec3(uvW * uScale, t);
+    vec3 p = geomPoint(uvW, t);
     float warp = fbmLod(p + vec3(fbmLod(p + vec3(t * 0.5), lod), fbmLod(p.yxz, lod), 0.0), lod);
     float n = fbmLod(p + uWarp * warp, lod);
 
@@ -377,21 +556,30 @@ float heightField(vec2 uvW, vec2 uv0, vec2 mUv, float mouseOn, float t, float lo
 }
 
 // --- Surface normal by forward differences on the height field ---
-// eps doubles as the smoothing control: a wider step averages over more
-// detail, so high-frequency octaves stop showing up as normal noise.
+// eps is a world-space step and doubles as the smoothing control: a wider step
+// averages over more detail, so high-frequency octaves stop showing up as
+// normal noise. The tangent frame lifts the 2D gradient into world space, which
+// is what lets the sphere and tunnel light correctly.
 vec3 surfaceNormal(vec2 uvW, vec2 uv0, vec2 mUv, float mouseOn, float t, float lod, float h, float eps) {
-    vec2 dx = vec2(eps, 0.0);
-    vec2 dy = vec2(0.0, eps);
+    vec3 geomNrm, tanX, tanY;
+    vec2 metric;
+    surfaceFrame(uv0, geomNrm, tanX, tanY, metric);
+
+    vec2 step = vec2(eps) / max(metric, vec2(0.02));
+    vec2 dx = vec2(step.x, 0.0);
+    vec2 dy = vec2(0.0, step.y);
     float hx = heightField(uvW + dx, uv0 + dx, mUv, mouseOn, t, lod);
     float hy = heightField(uvW + dy, uv0 + dy, mUv, mouseOn, t, lod);
+
     vec2 grad = vec2(hx - h, hy - h) / eps;
-    return normalize(vec3(-grad * u3DRelief * 0.35, 1.0));
+    return normalize(geomNrm - u3DRelief * 0.35 * (grad.x * tanX + grad.y * tanY));
 }
 
 // --- Blinn-Phong + fresnel rim + height/slope occlusion ---
 // viewDir points from the surface back toward the camera, so specular and rim
-// terms follow the camera when it tilts.
-vec3 shadeSurface(vec3 base, vec3 nrm, float h, vec3 viewDir) {
+// terms follow the camera when it tilts. geomNrm is the unperturbed surface
+// normal, which is what "facing up" means for the occlusion term.
+vec3 shadeSurface(vec3 base, vec3 nrm, float h, vec3 viewDir, vec3 geomNrm) {
     float az = radians(u3DLightAngle);
     float el = radians(clamp(u3DLightElev, 1.0, 89.0));
     vec3 lightDir = normalize(vec3(cos(az) * cos(el), sin(az) * cos(el), sin(el)));
@@ -402,7 +590,7 @@ vec3 shadeSurface(vec3 base, vec3 nrm, float h, vec3 viewDir) {
     float fresnel = pow(1.0 - clamp(dot(nrm, viewDir), 0.0, 1.0), 3.0) * u3DFresnel;
 
     // Valleys and steep flanks catch less light than plateaus
-    float occl = smoothstep(-0.15, 0.85, h) * (0.4 + 0.6 * nrm.z);
+    float occl = smoothstep(-0.15, 0.85, h) * (0.4 + 0.6 * dot(nrm, geomNrm));
     float shade = mix(1.0, occl, clamp(u3DShadow, 0.0, 1.0));
 
     vec3 col = base * (u3DAmbient + diffuse * u3DDiffuse * u3DLightColor) * shade;
@@ -426,29 +614,34 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     // Live mouse (iMouse.xy = lagged effect pos; z > 0 while active)
     float mouseOn = step(0.0, iMouse.z);
 
-    // Sampling space: screen uv, or the noise plane seen through the camera
+    // Sampling space: screen uv, or the surface of the geometry the camera sees
     vec2 uv = sUv;
     vec2 uv0 = sUv;
     vec2 mUv = iMouse.xy / iResolution.y;
     vec3 viewDir = vec3(0.0, 0.0, 1.0);
+    vec3 geomNrm = vec3(0.0, 0.0, 1.0);
     float footprint = 1.0 / max(iResolution.y, 1.0);
     float lod = float(uOctaves);
     float depth01 = 0.0;
 
     if (uCam != 0) {
-        vec2 planeUv;
+        vec2 surf;
         vec3 rayDir;
-        float dist = planeProject(sUv, planeUv, rayDir);
+        float dist = traceGeometry(sUv, surf, rayDir);
         if (dist < 0.0) {
-            // Above the horizon there is no surface, only atmosphere
+            // Missed the geometry: nothing out there but atmosphere
             fragColor = vec4(clamp(applyVignette(uCamHazeColor, fragCoord), 0.0, 1.0), 1.0);
             return;
         }
-        uv = planeUv;
-        uv0 = planeUv;
+        uv = surf;
+        uv0 = surf;
         mUv = spaceCoord(mUv);
         viewDir = -rayDir;
-        footprint = pixelFootprint(dist, rayDir);
+
+        vec3 tanX, tanY;
+        vec2 metric;
+        surfaceFrame(surf, geomNrm, tanX, tanY, metric);
+        footprint = pixelFootprint(dist, rayDir, geomNrm);
         depth01 = viewDepth(dist);
 
         float coc = focusCoc(depth01);
@@ -485,7 +678,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
             col = colorize(v + cycle);
         }
 
-        col = shadeSurface(col, nrm, shadeV, viewDir);
+        col = shadeSurface(col, nrm, shadeV, viewDir, geomNrm);
     } else {
         col = colorize(v + cycle);
         if (uColorMode == 0) {
@@ -685,7 +878,27 @@ const THREED_SLIDER_DEFS = [
 
 const DEFAULT_LIGHT_COLOR = "#fff6e8";
 
-/* Perspective camera: each pixel becomes a ray cast at the noise plane, so tilt
+const GEOMETRY_OPTIONS = [
+  { value: 0, label: "Plane" },
+  { value: 1, label: "Sphere" },
+  { value: 2, label: "Tunnel" },
+];
+
+/* Tilt / Orbit / Elevation aim the camera differently per geometry, so the
+ * labels and the section hint follow the active one. */
+const GEOMETRY_LABELS = {
+  0: { uCamPitch: "Tilt", uCamYaw: "Orbit", uCamHeight: "Elevation" },
+  1: { uCamPitch: "View latitude", uCamYaw: "Longitude", uCamHeight: "Distance" },
+  2: { uCamPitch: "Look off-axis", uCamYaw: "Roll", uCamHeight: "Tube radius" },
+};
+
+const GEOMETRY_HINTS = {
+  0: "Casts a ray per pixel at the noise plane, so Tilt and Orbit move the viewpoint instead of just panning the pattern. Mouse and anchor brushes land on the surface in perspective.",
+  1: "Wraps the field around a sphere by sampling the noise volume at each surface point, so there are no seams or polar pinching. Spin turns it like a planet; the light angle becomes a day/night terminator. The silhouette stays round \u2014 relief shades the surface rather than displacing it.",
+  2: "Puts the camera inside a tube and samples the noise around its wall, seamless all the way around. Spin / travel flies you along it, and Depth fade plus Aperture do the heavy lifting for the sense of depth.",
+};
+
+/* Perspective camera: each pixel becomes a ray cast at the geometry, so tilt
  * and focus are geometric rather than screen-space effects. */
 const CAMERA_SLIDER_DEFS = [
   { key: "uCamPitch",      label: "Tilt",         min: 0,  max: 88,  step: 1,    value: 45,   format: (v) => `${Math.round(v)}\u00b0` },
@@ -696,6 +909,7 @@ const CAMERA_SLIDER_DEFS = [
   { key: "uCamFocusRange", label: "Focus range",  min: 0,  max: 0.6, step: 0.01, value: 0.12, format: (v) => v.toFixed(2) },
   { key: "uCamAperture",   label: "Aperture",     min: 0,  max: 1,   step: 0.01, value: 0.4,  format: (v) => v.toFixed(2) },
   { key: "uCamHaze",       label: "Depth fade",   min: 0,  max: 1,   step: 0.01, value: 0.35, format: (v) => v.toFixed(2) },
+  { key: "uGeomMotion",    label: "Spin / travel", min: 0, max: 2,   step: 0.01, value: 0.15, format: (v) => v.toFixed(2) },
 ];
 
 const DEFAULT_HAZE_COLOR = "#10151c";
@@ -749,6 +963,7 @@ params.uColorMode = 0;
 params.u3D = 0;
 params.lightColor = DEFAULT_LIGHT_COLOR;
 params.uCam = 0;
+params.uGeom = 0;
 params.hazeColor = DEFAULT_HAZE_COLOR;
 params.uDynamicSpeed = 0;
 params.uMouseInteract = 0;
@@ -761,6 +976,7 @@ params.anchors = [];
 const paramsList = document.getElementById("params-list");
 const paramsPanel = document.getElementById("params-panel");
 const valueEls = {};
+const labelEls = {};
 let syncingFromParams = false;
 let gradientPreviewEl = null;
 let colorModeSelect = null;
@@ -771,6 +987,8 @@ let threeDInput = null;
 let lightColorInput = null;
 let cameraInput = null;
 let hazeColorInput = null;
+let geometrySelect = null;
+let geometryHintEl = null;
 let stopsHostEl = null;
 let stopCountLabelEl = null;
 let anchorsHostEl = null;
@@ -836,6 +1054,7 @@ function buildParamsBlock(src) {
   }
   lines.push(`const vec3  u3DLightColor = ${formatVec3(p.lightColor || DEFAULT_LIGHT_COLOR)};`);
   lines.push(`const int   uCam = ${p.uCam ? 1 : 0};`);
+  lines.push(`const int   uGeom = ${p.uGeom | 0};`);
   for (const def of CAMERA_SLIDER_DEFS) {
     lines.push(`const float ${def.key} = ${formatGlslLiteral(def, p[def.key])};`);
   }
@@ -902,6 +1121,14 @@ function updateCameraVisibility() {
   });
   if (cameraInput) cameraInput.checked = on;
   if (valueEls.uCam) valueEls.uCam.textContent = on ? "on" : "off";
+
+  const geom = params.uGeom | 0;
+  if (geometrySelect) geometrySelect.value = String(geom);
+  if (geometryHintEl) geometryHintEl.textContent = GEOMETRY_HINTS[geom];
+  const labels = GEOMETRY_LABELS[geom] || GEOMETRY_LABELS[0];
+  for (const key of Object.keys(labels)) {
+    if (labelEls[key]) labelEls[key].textContent = labels[key];
+  }
 }
 
 function updateColorModeVisibility() {
@@ -937,6 +1164,7 @@ function applyParamsToUI() {
   updateCameraVisibility();
   updateColorModeVisibility();
   renderAnchorsUI();
+  updateSectionSummaries();
 }
 
 function parseAnchorFromCode(code, i) {
@@ -1013,6 +1241,12 @@ function parseParamsFromCode(code) {
   if (camM) {
     const v = parseInt(camM[1], 10) ? 1 : 0;
     if (v !== params.uCam) { params.uCam = v; changed = true; }
+  }
+
+  const geomM = code.match(/const\s+int\s+uGeom\s*=\s*(\d+)\s*;/);
+  if (geomM) {
+    const v = Math.min(2, Math.max(0, parseInt(geomM[1], 10)));
+    if (v !== params.uGeom) { params.uGeom = v; changed = true; }
   }
 
   const hazeM = code.match(
@@ -1103,6 +1337,7 @@ function makeSliderRow(def) {
 
   const name = document.createElement("span");
   name.textContent = def.label;
+  labelEls[def.key] = name;
 
   const value = document.createElement("span");
   value.className = "value";
@@ -1132,6 +1367,112 @@ function makeSliderRow(def) {
   row.appendChild(label);
   row.appendChild(input);
   return row;
+}
+
+/* Collapsible sections keep the panel scannable now that it holds six feature
+ * groups. Headers show a live summary of what is active inside, so a collapsed
+ * section still tells you its state at a glance. Open/closed choices persist. */
+const SECTIONS_KEY = "perlinSectionsOpen:v1";
+const sectionSummaryEls = {};
+let sectionOpenState = null;
+
+function loadSectionState() {
+  if (sectionOpenState) return sectionOpenState;
+  let saved = null;
+  try {
+    saved = JSON.parse(localStorage.getItem(SECTIONS_KEY));
+  } catch (_) {
+    /* fall through to the default */
+  }
+  sectionOpenState = saved && typeof saved === "object"
+    ? saved
+    : { noise: true };   // first visit: only the essentials expanded
+  return sectionOpenState;
+}
+
+function storeSectionState() {
+  try {
+    localStorage.setItem(SECTIONS_KEY, JSON.stringify(sectionOpenState));
+  } catch (_) {
+    /* storage unavailable — sections just reset next visit */
+  }
+}
+
+/**
+ * Section with a clickable header that folds its body away. Returns { root,
+ * body }: callers append controls to body and mount root in the panel.
+ */
+function makeCollapsibleSection(id, titleText, extraClass) {
+  const open = !!loadSectionState()[id];
+
+  const root = document.createElement("div");
+  root.className = "param-section" + (extraClass ? " " + extraClass : "");
+  root.classList.toggle("collapsed", !open);
+
+  const header = document.createElement("button");
+  header.type = "button";
+  header.className = "param-section-header";
+  header.setAttribute("aria-expanded", String(open));
+
+  const chevron = document.createElement("span");
+  chevron.className = "section-chevron";
+  chevron.textContent = "\u25B8";
+
+  const name = document.createElement("span");
+  name.className = "section-name";
+  name.textContent = titleText;
+
+  const summary = document.createElement("span");
+  summary.className = "section-summary";
+  sectionSummaryEls[id] = summary;
+
+  header.appendChild(chevron);
+  header.appendChild(name);
+  header.appendChild(summary);
+
+  const body = document.createElement("div");
+  body.className = "param-section-body";
+
+  header.addEventListener("click", () => {
+    const nowOpen = root.classList.contains("collapsed");
+    root.classList.toggle("collapsed", !nowOpen);
+    header.setAttribute("aria-expanded", String(nowOpen));
+    sectionOpenState[id] = nowOpen;
+    storeSectionState();
+    if (nowOpen) header.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  });
+
+  root.appendChild(header);
+  root.appendChild(body);
+  return { root, body };
+}
+
+/** Refresh the at-a-glance text on every section header. */
+function updateSectionSummaries() {
+  const set = (id, text) => {
+    if (sectionSummaryEls[id]) sectionSummaryEls[id].textContent = text;
+  };
+
+  const presetCount = loadPresets().length;
+  set("presets", presetCount ? `${presetCount} saved` : "none saved");
+
+  set("noise", `scale ${Number(params.uScale).toFixed(1)} \u00b7 ${params.uOctaves} oct`);
+  set("threed", params.u3D ? "on" : "off");
+
+  const geom = GEOMETRY_OPTIONS.find((o) => o.value === (params.uGeom | 0)) || GEOMETRY_OPTIONS[0];
+  set("camera", params.uCam ? geom.label.toLowerCase() : "off");
+
+  const mouseOpt = MOUSE_INTERACT_OPTIONS.find((o) => o.value === params.uMouseInteract);
+  let mouseText = params.uMouseInteract > 0 && mouseOpt
+    ? mouseOpt.label.split(" /")[0].toLowerCase()
+    : "off";
+  const anchorCount = params.anchors.length;
+  if (anchorCount > 0) {
+    mouseText += ` \u00b7 ${anchorCount} anchor${anchorCount > 1 ? "s" : ""}`;
+  }
+  set("mouse", mouseText);
+
+  set("color", params.uColorMode ? `gradient \u00b7 ${params.uStopCount} stops` : "cosine");
 }
 
 /** Checkbox row plus explanatory hint, used by the 3D and Camera sections. */
@@ -1182,6 +1523,37 @@ function makeToggleBlock(opts) {
   }
 
   return { block, input };
+}
+
+/** Dropdown row bound to an int param. */
+function makeSelectRow(opts) {
+  const row = document.createElement("div");
+  row.className = "param-row param-toggle-row";
+  if (opts.dataAttr) row.setAttribute(opts.dataAttr, "1");
+
+  const label = document.createElement("label");
+  label.className = "param-label param-toggle-label";
+  label.htmlFor = "param-" + opts.key;
+  const name = document.createElement("span");
+  name.textContent = opts.label;
+  label.appendChild(name);
+
+  const select = document.createElement("select");
+  select.id = "param-" + opts.key;
+  select.className = "param-select";
+  select.innerHTML = opts.options
+    .map((o) => `<option value="${o.value}">${o.label}</option>`)
+    .join("");
+  select.value = String(params[opts.key]);
+  select.addEventListener("change", () => {
+    params[opts.key] = parseInt(select.value, 10);
+    opts.onChange();
+    syncParamsToEditor();
+  });
+
+  row.appendChild(label);
+  row.appendChild(select);
+  return { row, select };
 }
 
 /** Color swatch row (light color, haze color). */
@@ -1309,13 +1681,7 @@ function renderStopPickers() {
 }
 
 function buildColorSection() {
-  const section = document.createElement("div");
-  section.className = "param-section";
-
-  const title = document.createElement("div");
-  title.className = "param-section-title";
-  title.textContent = "Color";
-  section.appendChild(title);
+  const { root, body: section } = makeCollapsibleSection("color", "Color");
 
   const modeRow = document.createElement("div");
   modeRow.className = "param-row";
@@ -1411,17 +1777,11 @@ function buildColorSection() {
   gradBlock.appendChild(stopsHostEl);
 
   section.appendChild(gradBlock);
-  return section;
+  return root;
 }
 
 function buildThreeDSection() {
-  const section = document.createElement("div");
-  section.className = "param-section";
-
-  const title = document.createElement("div");
-  title.className = "param-section-title";
-  title.textContent = "3D & Lighting";
-  section.appendChild(title);
+  const { root, body: section } = makeCollapsibleSection("threed", "3D & Lighting");
 
   const made = makeToggleBlock({
     key: "u3D",
@@ -1455,27 +1815,37 @@ function buildThreeDSection() {
   refractHint.textContent = "Refraction bends the view ray through the surface and resamples the field, splitting channels for a glassy dispersion. Raise Smoothing if the relief looks grainy.";
   section.appendChild(refractHint);
 
-  return section;
+  return root;
 }
 
 function buildCameraSection() {
-  const section = document.createElement("div");
-  section.className = "param-section";
-
-  const title = document.createElement("div");
-  title.className = "param-section-title";
-  title.textContent = "Camera";
-  section.appendChild(title);
+  const { root, body: section } = makeCollapsibleSection("camera", "Camera");
 
   const made = makeToggleBlock({
     key: "uCam",
     label: "Perspective",
-    title: "View the noise plane through a tilting camera",
-    hint: "Casts a ray per pixel at the noise plane, so Tilt and Orbit move the viewpoint instead of just panning the pattern. Mouse and anchor brushes land on the surface in perspective.",
+    title: "Cast a ray per pixel at a surface instead of sampling screen space",
+    hint: "Views the noise on a surface in perspective instead of flat on the screen. Free while switched off.",
     onChange: updateCameraVisibility,
   });
   cameraInput = made.input;
   section.appendChild(made.block);
+
+  const geomRow = makeSelectRow({
+    key: "uGeom",
+    label: "Geometry",
+    options: GEOMETRY_OPTIONS,
+    dataAttr: "data-camera",
+    onChange: updateCameraVisibility,
+  });
+  geometrySelect = geomRow.select;
+  section.appendChild(geomRow.row);
+
+  geometryHintEl = document.createElement("p");
+  geometryHintEl.className = "param-hint";
+  geometryHintEl.setAttribute("data-camera", "1");
+  geometryHintEl.textContent = GEOMETRY_HINTS[params.uGeom | 0];
+  section.appendChild(geometryHintEl);
 
   for (const def of CAMERA_SLIDER_DEFS) {
     const sliderRow = makeSliderRow(def);
@@ -1499,17 +1869,11 @@ function buildCameraSection() {
   focusHint.textContent = "Focus distance runs 0 (nearest) to 1 (horizon), with Focus range as the sharp band around it. Aperture sets how much detail defocused depths lose \u2014 there is no extra sampling cost. Depth fade blends distance into the haze color, which also fills the sky above the horizon.";
   section.appendChild(focusHint);
 
-  return section;
+  return root;
 }
 
 function buildMouseSection() {
-  const section = document.createElement("div");
-  section.className = "param-section";
-
-  const title = document.createElement("div");
-  title.className = "param-section-title";
-  title.textContent = "Mouse";
-  section.appendChild(title);
+  const { root, body: section } = makeCollapsibleSection("mouse", "Mouse & Anchors");
 
   const modeRow = document.createElement("div");
   modeRow.className = "param-row";
@@ -1592,7 +1956,7 @@ function buildMouseSection() {
   }
 
   section.appendChild(buildAnchorsBlock());
-  return section;
+  return root;
 }
 
 function makeAnchorSlider(anchor, index, key, label, min, max, step) {
@@ -1763,6 +2127,7 @@ const SCALAR_PARAM_KEYS = [
   "u3D",
   ...THREED_SLIDER_DEFS.map((d) => d.key),
   "uCam",
+  "uGeom",
   ...CAMERA_SLIDER_DEFS.map((d) => d.key),
   "uMouseInteract",
   "uMouseLagMode",
@@ -1793,6 +2158,7 @@ function applySerializedParams(cfg) {
   params.uDynamicSpeed = params.uDynamicSpeed ? 1 : 0;
   params.u3D = params.u3D ? 1 : 0;
   params.uCam = params.uCam ? 1 : 0;
+  params.uGeom = Math.min(2, Math.max(0, params.uGeom | 0));
   params.uStopCount = Math.max(MIN_STOPS, Math.min(MAX_STOPS, params.uStopCount | 0));
 
   const hexRe = /^#[0-9a-f]{3,6}$/i;
@@ -2239,6 +2605,7 @@ function renderPresetsList() {
   if (!presetsHostEl) return;
   const list = loadPresets();
   presetsHostEl.innerHTML = "";
+  updateSectionSummaries();
 
   if (list.length === 0) {
     const empty = document.createElement("p");
@@ -2283,13 +2650,8 @@ function renderPresetsList() {
 }
 
 function buildPresetsSection() {
-  const section = document.createElement("div");
-  section.className = "param-section presets-section";
-
-  const title = document.createElement("div");
-  title.className = "param-section-title";
-  title.textContent = "Presets";
-  section.appendChild(title);
+  const { root, body: section } =
+    makeCollapsibleSection("presets", "Presets", "presets-section");
 
   const saveRow = document.createElement("div");
   saveRow.className = "preset-save-row";
@@ -2322,26 +2684,25 @@ function buildPresetsSection() {
   section.appendChild(presetsHostEl);
 
   renderPresetsList();
-  return section;
+  return root;
+}
+
+function buildNoiseSection() {
+  const { root, body } = makeCollapsibleSection("noise", "Noise");
+  for (const def of PARAM_DEFS) {
+    body.appendChild(makeSliderRow(def));
+    if (def.key === "uSpeed") {
+      body.appendChild(makeDynamicSpeedToggle());
+    }
+  }
+  return root;
 }
 
 function buildParamsUI() {
   paramsList.innerHTML = "";
 
   paramsList.appendChild(buildPresetsSection());
-
-  const noiseTitle = document.createElement("div");
-  noiseTitle.className = "param-section-title";
-  noiseTitle.textContent = "Noise";
-  paramsList.appendChild(noiseTitle);
-
-  for (const def of PARAM_DEFS) {
-    paramsList.appendChild(makeSliderRow(def));
-    if (def.key === "uSpeed") {
-      paramsList.appendChild(makeDynamicSpeedToggle());
-    }
-  }
-
+  paramsList.appendChild(buildNoiseSection());
   paramsList.appendChild(buildThreeDSection());
   paramsList.appendChild(buildCameraSection());
   paramsList.appendChild(buildMouseSection());
@@ -2350,6 +2711,7 @@ function buildParamsUI() {
   updateDynamicSpeedUI();
   updateThreeDVisibility();
   updateCameraVisibility();
+  updateSectionSummaries();
 }
 
 /* ============================================================
@@ -2778,6 +3140,7 @@ function compile(options = {}) {
 }
 
 function syncParamsToEditor() {
+  updateSectionSummaries();
   const block = buildParamsBlock();
   let code = editor.getValue();
   if (PARAMS_BLOCK_RE.test(code)) {
@@ -2807,6 +3170,7 @@ function resetParams() {
   params.u3D = 0;
   params.lightColor = DEFAULT_LIGHT_COLOR;
   params.uCam = 0;
+  params.uGeom = 0;
   params.hazeColor = DEFAULT_HAZE_COLOR;
   params.uMouseInteract = 0;
   params.uMouseLagMode = 0;

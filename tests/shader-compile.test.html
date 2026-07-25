@@ -127,6 +127,23 @@ async function run() {
       shader: withConsts({ uCam: "1", uCamAperture: "1.0", uCamFocus: "0.8" }),
     },
     { name: "camera + 3D relief", shader: withConsts({ uCam: "1", u3D: "1" }) },
+    { name: "sphere geometry", shader: withConsts({ uCam: "1", uGeom: "1" }) },
+    {
+      name: "sphere + 3D + refraction + interact",
+      shader: withConsts({
+        uCam: "1", uGeom: "1", u3D: "1", u3DRefract: "0.4",
+        uMouseInteract: "2", uAnchorCount: "3", uA0Mode: "4", uA1Mode: "1", uA2Mode: "5",
+      }),
+    },
+    { name: "sphere over the pole", shader: withConsts({ uCam: "1", uGeom: "1", uCamPitch: "88.0" }) },
+    { name: "tunnel geometry", shader: withConsts({ uCam: "1", uGeom: "2", uCamPitch: "0.0" }) },
+    {
+      name: "tunnel + 3D + depth of field + gradient",
+      shader: withConsts({
+        uCam: "1", uGeom: "2", u3D: "1", uCamAperture: "0.8", uColorMode: "1",
+        uGeomMotion: "1.5",
+      }),
+    },
     {
       name: "camera + 3D + refraction + depth of field",
       shader: withConsts({

@@ -71,7 +71,9 @@ test("3D shading samples a shared height field", () => {
   assert.ok(shader.includes("normalize(lightDir + viewDir)"));
   // Specular and refraction follow the camera rather than a fixed view axis.
   assert.ok(shader.includes("refract(-viewDir, nrm"));
-  assert.ok(shader.includes("vec3 shadeSurface(vec3 base, vec3 nrm, float h, vec3 viewDir)"));
+  assert.ok(shader.includes("vec3 shadeSurface(vec3 base, vec3 nrm, float h, vec3 viewDir, vec3 geomNrm)"));
+  // Occlusion leans on the unperturbed normal, not a hardcoded up axis.
+  assert.ok(shader.includes("(0.4 + 0.6 * dot(nrm, geomNrm))"));
   // Whole 3D path sits behind a const branch so it compiles away when off.
   assert.ok(shader.includes("if (u3D != 0) {"));
 });
@@ -85,17 +87,39 @@ test("camera uniforms are declared in the controls block", () => {
   }
 });
 
-test("camera projects screen rays onto the noise plane", () => {
-  assert.ok(shader.includes("float planeProject(vec2 sUv, out vec2 planeUv, out vec3 rayDir)"));
-  // Rays above the horizon report a miss instead of a bogus hit behind the eye.
-  assert.ok(shader.includes("if (rayDir.z > -1e-4) return -1.0;"));
-  // Mouse and anchors must be projected into the same space as the surface.
+test("camera casts screen rays at the active geometry", () => {
+  assert.ok(shader.includes("float traceGeometry(vec2 sUv, out vec2 s, out vec3 rayDir)"));
+  // Rays that pass above the plane's horizon report a miss, not a hit behind the eye.
+  assert.ok(shader.includes("if (rd.z > -1e-4) return -1.0;"));
+  // Mouse and anchors must be traced into the same space as the surface.
   assert.ok(shader.includes("vec2 spaceCoord(vec2 sUv)"));
   assert.ok(shader.includes("return spaceCoord(sUv);"));
   assert.ok(shader.includes("mUv = spaceCoord(mUv);"));
   // Whole camera path sits behind a const branch so it compiles away when off.
   assert.ok(shader.includes("if (uCam != 0) {"));
   assert.ok(shader.includes("if (uCam == 0) return sUv;"));
+});
+
+test("geometry modes share one sampling pipeline", () => {
+  // Each geometry contributes an intersection, a tangent frame, and a mapping
+  // from surface coordinates into the 3D noise volume.
+  assert.ok(shader.includes("float hitPlane(vec3 ro, vec3 rd, out vec2 s)"));
+  assert.ok(shader.includes("float hitSphere(vec3 ro, vec3 rd, out vec2 s)"));
+  assert.ok(shader.includes("float hitTunnel(vec3 rd, out vec2 s)"));
+  assert.ok(shader.includes("void surfaceFrame(vec2 s, out vec3 nrm, out vec3 tanX, out vec3 tanY, out vec2 metric)"));
+  assert.ok(shader.includes("vec3 geomPoint(vec2 s, float t)"));
+  // Plane mode must still build exactly the coordinate it always did.
+  assert.ok(shader.includes("return vec3(s * uScale, t);"));
+  assert.ok(shader.includes("vec3 p = geomPoint(uvW, t);"));
+  // Normals lift the 2D gradient through the tangent frame, scaled by the metric.
+  assert.ok(shader.includes("vec2 step = vec2(eps) / max(metric, vec2(0.02));"));
+  assert.ok(shader.includes("normalize(geomNrm - u3DRelief * 0.35 * (grad.x * tanX + grad.y * tanY))"));
+  // Wrapping coordinates need brush centers pulled into the pixel's lap.
+  assert.ok(shader.includes("vec2 alignSeam(vec2 center, vec2 ref)"));
+  assert.ok(shader.includes("center = alignSeam(center, uv0);"));
+  assert.ok(shader.includes("alignSeam(center, uv0), radius, blurAmt, activeAmt)"));
+  // floor(x + 0.5) because round() does not exist in GLSL ES 1.00.
+  assert.ok(shader.includes("period * floor((ref.x - center.x) / period + 0.5)"));
 });
 
 test("depth of field and horizon aliasing ride the fBm octave budget", () => {
@@ -133,16 +157,30 @@ test("camera sliders and shader camera constants are the same set", () => {
     .sort();
 
   const block = shader.match(/\/\/ === CONTROLS BEGIN ===([\s\S]*?)\/\/ === CONTROLS END ===/)[1];
-  const declared = (block.match(/const\s+float\s+(uCam\w+)\s*=/g) || [])
-    .map((s) => s.match(/(uCam\w+)/)[1])
+  const declared = (block.match(/const\s+float\s+(u(?:Cam|Geom)\w+)\s*=/g) || [])
+    .map((s) => s.match(/(u(?:Cam|Geom)\w+)/)[1])
     .sort();
 
   assert.deepStrictEqual(declared, sliderKeys);
-  // The toggle and haze color are typed separately, so check them by hand.
+  // The two toggles and the haze color are typed separately.
   assert.ok(/const\s+int\s+uCam\s*=/.test(block));
+  assert.ok(/const\s+int\s+uGeom\s*=/.test(block));
   assert.ok(/const\s+vec3\s+uCamHazeColor\s*=/.test(block));
   // Every one is written by buildParamsBlock, not just declared in the default.
   assert.ok(appSrc.includes("for (const def of CAMERA_SLIDER_DEFS) {\n    lines.push("));
+  assert.ok(appSrc.includes("lines.push(`const int   uGeom = ${p.uGeom | 0};`)"));
+});
+
+test("geometry mode is a first-class param (UI, presets, parsing)", () => {
+  assert.ok(appSrc.includes("const GEOMETRY_OPTIONS = ["));
+  // Labels and hint text follow the geometry, since Tilt/Orbit/Elevation are
+  // reinterpreted per mode.
+  assert.ok(appSrc.includes("const GEOMETRY_LABELS = {"));
+  assert.ok(appSrc.includes("const GEOMETRY_HINTS = {"));
+  assert.ok(appSrc.includes('uCamHeight: "Tube radius"'));
+  assert.ok(appSrc.includes("/const\\s+int\\s+uGeom\\s*=\\s*(\\d+)\\s*;/"));
+  assert.ok(appSrc.includes('"uGeom",'));
+  assert.ok(appSrc.includes("params.uGeom = Math.min(2, Math.max(0, params.uGeom | 0));"));
 });
 
 test("3D params are written to the controls block and parsed back", () => {
