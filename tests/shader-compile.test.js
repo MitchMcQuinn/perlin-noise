@@ -125,7 +125,7 @@ test("geometry modes share one sampling pipeline", () => {
 test("depth of field and horizon aliasing ride the fBm octave budget", () => {
   // Blur is a detail cut, not extra taps: fbmLod carries a fractional budget.
   assert.ok(shader.includes("float fbmLod(vec3 p, float lod)"));
-  assert.ok(shader.includes("float w = clamp(lod - float(i), 0.0, 1.0);"));
+  assert.ok(shader.includes("float w = clamp(budget - float(i), 0.0, 1.0);"));
   assert.ok(shader.includes("float fbm(vec3 p) {"));
   assert.ok(shader.includes("return fbmLod(p, float(uOctaves));"));
   // Height field and normals take the same budget so they defocus together.
@@ -260,6 +260,25 @@ test("export builds a self-contained web-background page", () => {
   assert.ok(appSrc.includes("function exportPresetToFile("));
   assert.ok(appSrc.includes("function downloadTextFile("));
   assert.ok(appSrc.includes("preset-export-btn"));
+});
+
+test("compile rewrites controls consts to uniforms", () => {
+  assert.ok(appSrc.includes("function rewriteControlsToUniforms("));
+  assert.ok(appSrc.includes("function uploadParamsUniforms("));
+  const rewritten = shader.replace(
+    /\/\/ === CONTROLS BEGIN ===[\s\S]*?\/\/ === CONTROLS END ===/,
+    (block) => block.replace(
+      /const\s+(float|int|vec3)\s+(\w+)\s*=\s*[^;]+;/g,
+      "uniform $1 $2;"
+    )
+  );
+  assert.ok(rewritten.includes("uniform float uScale"));
+  assert.ok(rewritten.includes("uniform int uOctaves"));
+  assert.ok(rewritten.includes("uniform vec3 uColor0"));
+  assert.ok(!/const\s+float\s+uScale\s*=/.test(rewritten));
+  const origLines = shader.split("\n").length;
+  const nextLines = rewritten.split("\n").length;
+  assert.strictEqual(nextLines, origLines, "uniform rewrite must keep editor line numbers");
 });
 
 if (!process.exitCode) console.log(`\n${passed} passed`);

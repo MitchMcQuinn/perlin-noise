@@ -13,7 +13,7 @@
 
 const DEFAULT_SHADER = `// Animated Perlin noise (fBm)
 // Classic gradient noise, 3D, sliced through z = time.
-// The Controls panel rewrites the block below and recompiles live.
+// The Controls panel rewrites the block below. Values are uploaded as uniforms.
 // You can also edit values by hand, then press Cmd/Ctrl+Enter.
 
 // === CONTROLS BEGIN ===
@@ -130,9 +130,10 @@ float perlin(vec3 p) {
 float fbmLod(vec3 p, float lod) {
     float value = 0.0;
     float amplitude = 0.5;
+    // Cap with a float so this stays valid when uOctaves is a uniform.
+    float budget = min(lod, float(uOctaves));
     for (int i = 0; i < 8; i++) {
-        if (i >= uOctaves) break;
-        float w = clamp(lod - float(i), 0.0, 1.0);
+        float w = clamp(budget - float(i), 0.0, 1.0);
         if (w <= 0.0) break;
         value += amplitude * w * perlin(p);
         p = p * uLacunarity + vec3(13.7, 7.3, 3.1);
@@ -462,8 +463,11 @@ vec3 gradientColor(float t) {
 
     int i0 = 0;
     for (int i = 0; i < 4; i++) {
-        if (i < n - 1 && t >= stopPos(i)) i0 = i;
+        if (t >= stopPos(i)) i0 = i;
     }
+    int last = n - 1;
+    if (i0 > last - 1) i0 = last - 1;
+    if (i0 < 0) i0 = 0;
     int i1 = i0 + 1;
     if (i1 > n - 1) i1 = n - 1;
 
@@ -703,10 +707,10 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 
 const canvas = document.getElementById("glcanvas");
 
-let gl = canvas.getContext("webgl2", { antialias: false });
+let gl = canvas.getContext("webgl2", { antialias: false, preserveDrawingBuffer: true });
 let isWebGL2 = !!gl;
 if (!gl) {
-  gl = canvas.getContext("webgl", { antialias: false });
+  gl = canvas.getContext("webgl", { antialias: false, preserveDrawingBuffer: true });
 }
 if (!gl) {
   document.getElementById("canvas-wrap").innerHTML =
@@ -801,12 +805,23 @@ if (!isWebGL2) {
 
 let program = null; // current (last-good) program
 let uniforms = {};
+let paramUniforms = {};
+let usingParamUniforms = false;
 
-function buildProgram(userCode) {
+function rewriteControlsToUniforms(code) {
+  return String(code || "").replace(
+    /\/\/ === CONTROLS BEGIN ===[\s\S]*?\/\/ === CONTROLS END ===/,
+    (block) => block.replace(
+      /const\s+(float|int|vec3)\s+(\w+)\s*=\s*[^;]+;/g,
+      "uniform $1 $2;"
+    )
+  );
+}
+
+function compileWrapped(userCode) {
   const src = isWebGL2
     ? HEADER_300 + userCode + FOOTER_300
     : HEADER_100 + userCode + FOOTER_100;
-
   const frag = compileShader(gl.FRAGMENT_SHADER, src);
   if (!frag.ok) return { ok: false, log: frag.log };
 
@@ -822,23 +837,41 @@ function buildProgram(userCode) {
     gl.deleteProgram(prog);
     return { ok: false, log };
   }
+  return { ok: true, program: prog };
+}
+
+function buildProgram(userCode) {
+  const uniformSrc = rewriteControlsToUniforms(userCode);
+  let compiled = compileWrapped(uniformSrc);
+  let asUniforms = true;
+  if (!compiled.ok) {
+    compiled = compileWrapped(userCode);
+    asUniforms = false;
+  }
+  if (!compiled.ok) return { ok: false, log: compiled.log };
 
   if (program) gl.deleteProgram(program);
-  program = prog;
+  program = compiled.program;
+  usingParamUniforms = asUniforms;
+  paramUniforms = {};
+  if (usingParamUniforms && !gl.getUniformLocation(program, "uScale")) {
+    usingParamUniforms = false;
+  }
   uniforms = {
-    iResolution: gl.getUniformLocation(prog, "iResolution"),
-    iTime: gl.getUniformLocation(prog, "iTime"),
-    iTimeDelta: gl.getUniformLocation(prog, "iTimeDelta"),
-    iFrame: gl.getUniformLocation(prog, "iFrame"),
-    iMouse: gl.getUniformLocation(prog, "iMouse"),
+    iResolution: gl.getUniformLocation(program, "iResolution"),
+    iTime: gl.getUniformLocation(program, "iTime"),
+    iTimeDelta: gl.getUniformLocation(program, "iTimeDelta"),
+    iFrame: gl.getUniformLocation(program, "iFrame"),
+    iMouse: gl.getUniformLocation(program, "iMouse"),
   };
   return { ok: true };
 }
 
 /* ============================================================
  * Adjustable shader parameters (Controls panel)
- * Values live in the editor as a marked const block and are
- * rewritten + recompiled whenever a control changes.
+ * Values live in the editor as a marked const block. The compiler
+ * rewrites that block to uniforms so sliders and the timeline can
+ * update every frame without recompiling.
  * ============================================================ */
 
 const PARAM_DEFS = [
@@ -973,6 +1006,36 @@ params.stops = DEFAULT_STOPS.slice();
 params.positions = evenPositions(MAX_STOPS);
 params.anchors = [];
 
+const STAGE_ASPECT_PRESETS = [
+  { id: "16:9", w: 16, h: 9 },
+  { id: "16:10", w: 16, h: 10 },
+  { id: "4:3", w: 4, h: 3 },
+  { id: "1:1", w: 1, h: 1 },
+  { id: "9:16", w: 9, h: 16 },
+  { id: "custom", w: 16, h: 9 },
+];
+
+const stageSettings = {
+  aspectPreset: "16:9",
+  aspectW: 16,
+  aspectH: 9,
+  customAspectW: 16,
+  customAspectH: 9,
+  outputPreset: "1080p",
+  customW: 1920,
+  customH: 1080,
+  exportFps: 60,
+};
+
+let stageAspectSelect = null;
+let stageOutputSelect = null;
+let stageFpsSelect = null;
+let stageCustomAspect = null;
+let stageCustomOutput = null;
+let stageOutReadout = null;
+let suppressEditorSync = false;
+let stageExportLock = false;
+
 const paramsList = document.getElementById("params-list");
 const paramsPanel = document.getElementById("params-panel");
 const valueEls = {};
@@ -1075,6 +1138,77 @@ function buildParamsBlock(src) {
   }
   lines.push("// === CONTROLS END ===");
   return lines.join("\n");
+}
+
+function paramLoc(name) {
+  if (!program) return null;
+  if (!(name in paramUniforms)) paramUniforms[name] = gl.getUniformLocation(program, name);
+  return paramUniforms[name];
+}
+
+function uploadParamsUniforms(p) {
+  p = p || params;
+  if (!program || !usingParamUniforms) return;
+
+  const f = (name, v) => {
+    const loc = paramLoc(name);
+    if (loc) gl.uniform1f(loc, +v);
+  };
+  const i = (name, v) => {
+    const loc = paramLoc(name);
+    if (loc) gl.uniform1i(loc, v | 0);
+  };
+  const v3 = (name, hex) => {
+    const loc = paramLoc(name);
+    if (!loc) return;
+    const rgb = hexToRgb01(hex);
+    gl.uniform3f(loc, rgb[0], rgb[1], rgb[2]);
+  };
+
+  for (const def of PARAM_DEFS) {
+    if (def.int) i(def.key, p[def.key]);
+    else f(def.key, p[def.key]);
+  }
+  i("uDynamicSpeed", p.uDynamicSpeed);
+  i("uMouseInteract", p.uMouseInteract);
+  for (const def of MOUSE_SLIDER_DEFS) f(def.key, p[def.key]);
+  i("uMouseLagMode", p.uMouseLagMode);
+  const anchors = Array.isArray(p.anchors) ? p.anchors : [];
+  const count = Math.min(MAX_ANCHORS, anchors.length);
+  i("uAnchorCount", count);
+  for (let n = 0; n < MAX_ANCHORS; n++) {
+    const a = anchors[n] || {
+      mode: 0,
+      radius: 0.35,
+      blur: 0.55,
+      strength: 0.55,
+      x: n === 1 ? 0.25 : n === 2 ? 0.75 : 0.5,
+      y: 0.5,
+    };
+    i("uA" + n + "Mode", a.mode);
+    f("uA" + n + "Radius", a.radius);
+    f("uA" + n + "Blur", a.blur);
+    f("uA" + n + "Strength", a.strength);
+    f("uA" + n + "X", a.x);
+    f("uA" + n + "Y", a.y);
+  }
+  i("u3D", p.u3D);
+  for (const def of THREED_SLIDER_DEFS) f(def.key, p[def.key]);
+  v3("u3DLightColor", p.lightColor || DEFAULT_LIGHT_COLOR);
+  i("uCam", p.uCam);
+  i("uGeom", p.uGeom);
+  for (const def of CAMERA_SLIDER_DEFS) f(def.key, p[def.key]);
+  v3("uCamHazeColor", p.hazeColor || DEFAULT_HAZE_COLOR);
+  i("uColorMode", p.uColorMode);
+  for (const def of COLOR_SLIDER_DEFS) f(def.key, p[def.key]);
+  const stopCount = p.uStopCount | 0;
+  i("uStopCount", stopCount);
+  const pos = normalizePositions(p.positions || evenPositions(MAX_STOPS), stopCount);
+  const stops = Array.isArray(p.stops) ? p.stops : DEFAULT_STOPS;
+  for (let n = 0; n < MAX_STOPS; n++) {
+    f("uPos" + n, n < stopCount ? pos[n] : 1);
+    v3("uColor" + n, stops[n] || DEFAULT_STOPS[n]);
+  }
 }
 
 function updateGradientPreview() {
@@ -1386,7 +1520,7 @@ function loadSectionState() {
   }
   sectionOpenState = saved && typeof saved === "object"
     ? saved
-    : { noise: true };   // first visit: only the essentials expanded
+    : { stage: true, noise: true };   // first visit: stage + essentials expanded
   return sectionOpenState;
 }
 
@@ -1455,6 +1589,12 @@ function updateSectionSummaries() {
 
   const presetCount = loadPresets().length;
   set("presets", presetCount ? `${presetCount} saved` : "none saved");
+
+  const s = stageSettings;
+  const out = (typeof StageMath !== "undefined" && StageMath.outputPixels)
+    ? StageMath.outputPixels(s.aspectW, s.aspectH, s.outputPreset, s.customW, s.customH)
+    : { width: 1920, height: 1080 };
+  set("stage", `${s.aspectW}:${s.aspectH} \u00b7 ${out.width}\u00d7${out.height}`);
 
   set("noise", `scale ${Number(params.uScale).toFixed(1)} \u00b7 ${params.uOctaves} oct`);
   set("threed", params.u3D ? "on" : "off");
@@ -2148,8 +2288,9 @@ function serializeParams() {
   return out;
 }
 
-function applySerializedParams(cfg) {
+function applySerializedParams(cfg, opts) {
   if (!cfg || typeof cfg !== "object") return;
+  opts = opts || {};
 
   for (const k of SCALAR_PARAM_KEYS) {
     if (typeof cfg[k] === "number" && isFinite(cfg[k])) params[k] = cfg[k];
@@ -2198,10 +2339,12 @@ function applySerializedParams(cfg) {
     });
   }
 
+  if (opts.silent) return;
+
   placingAnchorIndex = -1;
   canvas.classList.remove("placing-anchor");
   applyParamsToUI();
-  syncParamsToEditor();
+  if (!opts.skipEditor) syncParamsToEditor();
 }
 
 function loadPresets() {
@@ -2687,6 +2830,166 @@ function buildPresetsSection() {
   return root;
 }
 
+function currentOutputPixels() {
+  if (typeof StageMath !== "undefined" && StageMath.outputPixels) {
+    return StageMath.outputPixels(
+      stageSettings.aspectW,
+      stageSettings.aspectH,
+      stageSettings.outputPreset,
+      stageSettings.customW,
+      stageSettings.customH
+    );
+  }
+  return { width: 1920, height: 1080 };
+}
+
+function applyStageAspectFromUI() {
+  const id = stageAspectSelect ? stageAspectSelect.value : stageSettings.aspectPreset;
+  stageSettings.aspectPreset = id;
+  const preset = STAGE_ASPECT_PRESETS.find((p) => p.id === id) || STAGE_ASPECT_PRESETS[0];
+  if (id === "custom") {
+    stageSettings.aspectW = Math.max(1, Number(stageSettings.customAspectW) || 16);
+    stageSettings.aspectH = Math.max(1, Number(stageSettings.customAspectH) || 9);
+  } else {
+    stageSettings.aspectW = preset.w;
+    stageSettings.aspectH = preset.h;
+  }
+  if (stageCustomAspect) stageCustomAspect.hidden = id !== "custom";
+  if (stageCustomOutput) stageCustomOutput.hidden = stageSettings.outputPreset !== "custom";
+  const out = currentOutputPixels();
+  if (stageOutReadout) stageOutReadout.textContent = `${out.width} \u00d7 ${out.height}`;
+  updateSectionSummaries();
+  resizeCanvas();
+}
+
+function refreshStageUI() {
+  if (stageAspectSelect) stageAspectSelect.value = stageSettings.aspectPreset;
+  if (stageOutputSelect) stageOutputSelect.value = stageSettings.outputPreset;
+  if (stageFpsSelect) stageFpsSelect.value = String(stageSettings.exportFps);
+  if (stageCustomAspect) {
+    const inputs = stageCustomAspect.querySelectorAll("input");
+    if (inputs[0]) inputs[0].value = String(stageSettings.customAspectW);
+    if (inputs[1]) inputs[1].value = String(stageSettings.customAspectH);
+    stageCustomAspect.hidden = stageSettings.aspectPreset !== "custom";
+  }
+  if (stageCustomOutput) {
+    const inputs = stageCustomOutput.querySelectorAll("input");
+    if (inputs[0]) inputs[0].value = String(stageSettings.customW);
+    if (inputs[1]) inputs[1].value = String(stageSettings.customH);
+    stageCustomOutput.hidden = stageSettings.outputPreset !== "custom";
+  }
+  applyStageAspectFromUI();
+}
+
+function makeNumberField(value, onChange) {
+  const input = document.createElement("input");
+  input.type = "number";
+  input.min = "1";
+  input.step = "1";
+  input.value = String(value);
+  input.addEventListener("change", () => {
+    const n = parseFloat(input.value);
+    if (isFinite(n) && n > 0) onChange(n);
+  });
+  return input;
+}
+
+function buildStageSection() {
+  const { root, body } = makeCollapsibleSection("stage", "Stage");
+
+  const aspectRow = document.createElement("div");
+  aspectRow.className = "param-row";
+  const aspectLabel = document.createElement("label");
+  aspectLabel.className = "param-label";
+  aspectLabel.innerHTML = "<span>Aspect</span>";
+  stageAspectSelect = document.createElement("select");
+  stageAspectSelect.className = "param-select";
+  stageAspectSelect.innerHTML = STAGE_ASPECT_PRESETS.map(
+    (p) => `<option value="${p.id}">${p.id}</option>`
+  ).join("");
+  stageAspectSelect.value = stageSettings.aspectPreset;
+  stageAspectSelect.addEventListener("change", applyStageAspectFromUI);
+  aspectRow.appendChild(aspectLabel);
+  aspectRow.appendChild(stageAspectSelect);
+  body.appendChild(aspectRow);
+
+  stageCustomAspect = document.createElement("div");
+  stageCustomAspect.className = "stage-custom-grid";
+  stageCustomAspect.hidden = true;
+  stageCustomAspect.appendChild(makeNumberField(stageSettings.customAspectW, (n) => {
+    stageSettings.customAspectW = n;
+    applyStageAspectFromUI();
+  }));
+  stageCustomAspect.appendChild(makeNumberField(stageSettings.customAspectH, (n) => {
+    stageSettings.customAspectH = n;
+    applyStageAspectFromUI();
+  }));
+  body.appendChild(stageCustomAspect);
+
+  const outRow = document.createElement("div");
+  outRow.className = "param-row";
+  const outLabel = document.createElement("label");
+  outLabel.className = "param-label";
+  outLabel.innerHTML = "<span>Output</span>";
+  stageOutReadout = document.createElement("span");
+  stageOutReadout.className = "stage-out-readout";
+  outLabel.appendChild(stageOutReadout);
+  stageOutputSelect = document.createElement("select");
+  stageOutputSelect.className = "param-select";
+  stageOutputSelect.innerHTML = [
+    ["1080p", "1080p"],
+    ["1440p", "1440p"],
+    ["4k", "4K"],
+    ["custom", "Custom"],
+  ].map(([v, l]) => `<option value="${v}">${l}</option>`).join("");
+  stageOutputSelect.value = stageSettings.outputPreset;
+  stageOutputSelect.addEventListener("change", () => {
+    stageSettings.outputPreset = stageOutputSelect.value;
+    applyStageAspectFromUI();
+  });
+  outRow.appendChild(outLabel);
+  outRow.appendChild(stageOutputSelect);
+  body.appendChild(outRow);
+
+  stageCustomOutput = document.createElement("div");
+  stageCustomOutput.className = "stage-custom-grid";
+  stageCustomOutput.hidden = true;
+  stageCustomOutput.appendChild(makeNumberField(stageSettings.customW, (n) => {
+    stageSettings.customW = Math.round(n);
+    applyStageAspectFromUI();
+  }));
+  stageCustomOutput.appendChild(makeNumberField(stageSettings.customH, (n) => {
+    stageSettings.customH = Math.round(n);
+    applyStageAspectFromUI();
+  }));
+  body.appendChild(stageCustomOutput);
+
+  const fpsRow = document.createElement("div");
+  fpsRow.className = "param-row";
+  const fpsLabel = document.createElement("label");
+  fpsLabel.className = "param-label";
+  fpsLabel.innerHTML = "<span>Export fps</span>";
+  stageFpsSelect = document.createElement("select");
+  stageFpsSelect.className = "param-select";
+  stageFpsSelect.innerHTML = '<option value="60">60</option><option value="30">30</option>';
+  stageFpsSelect.value = String(stageSettings.exportFps);
+  stageFpsSelect.addEventListener("change", () => {
+    stageSettings.exportFps = parseInt(stageFpsSelect.value, 10) === 30 ? 30 : 60;
+    updateSectionSummaries();
+  });
+  fpsRow.appendChild(fpsLabel);
+  fpsRow.appendChild(stageFpsSelect);
+  body.appendChild(fpsRow);
+
+  const hint = document.createElement("p");
+  hint.className = "param-hint";
+  hint.textContent = "Locks the preview to the projection frame. 1080p uses 1080 on the short edge (16:9 \u2192 1920\u00d71080, 9:16 \u2192 1080\u00d71920).";
+  body.appendChild(hint);
+
+  applyStageAspectFromUI();
+  return root;
+}
+
 function buildNoiseSection() {
   const { root, body } = makeCollapsibleSection("noise", "Noise");
   for (const def of PARAM_DEFS) {
@@ -2701,6 +3004,7 @@ function buildNoiseSection() {
 function buildParamsUI() {
   paramsList.innerHTML = "";
 
+  paramsList.appendChild(buildStageSection());
   paramsList.appendChild(buildPresetsSection());
   paramsList.appendChild(buildNoiseSection());
   paramsList.appendChild(buildThreeDSection());
@@ -2772,13 +3076,58 @@ const resReadout = document.getElementById("res-readout");
 const playBtn = document.getElementById("btn-play");
 
 function resizeCanvas() {
+  if (stageExportLock) return;
+  const wrap = document.getElementById("canvas-wrap");
+  const wrapW = wrap ? wrap.clientWidth : 0;
+  const wrapH = wrap ? wrap.clientHeight : 0;
+  if (wrapW < 2 || wrapH < 2) return;
+
+  const fit = (typeof StageMath !== "undefined" && StageMath.letterboxSize)
+    ? StageMath.letterboxSize(wrapW, wrapH, stageSettings.aspectW, stageSettings.aspectH)
+    : { width: wrapW, height: wrapH };
+  const cssW = Math.max(1, fit.width);
+  const cssH = Math.max(1, fit.height);
+  const left = (wrapW - cssW) / 2;
+  const top = (wrapH - cssH) / 2;
+  canvas.style.inset = "auto";
+  canvas.style.left = left + "px";
+  canvas.style.top = top + "px";
+  canvas.style.width = cssW + "px";
+  canvas.style.height = cssH + "px";
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
-  const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+  const w = Math.max(1, Math.floor(cssW * dpr));
+  const h = Math.max(1, Math.floor(cssH * dpr));
   if (canvas.width !== w || canvas.height !== h) {
     canvas.width = w;
     canvas.height = h;
-    resReadout.textContent = `${w} \u00d7 ${h}`;
+  }
+  if (resReadout) resReadout.textContent = `${w} \u00d7 ${h}`;
+}
+
+function captureIsDriven() {
+  return window.PerlinCapture && typeof window.PerlinCapture.isDriven === "function"
+    && window.PerlinCapture.isDriven();
+}
+
+function drawFrame(dt) {
+  if (!program) return;
+  const timeDelta = dt == null ? 0 : dt;
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.useProgram(program);
+  gl.uniform3f(uniforms.iResolution, canvas.width, canvas.height, 1.0);
+  gl.uniform1f(uniforms.iTime, state.shaderTime);
+  gl.uniform1f(uniforms.iTimeDelta, timeDelta);
+  gl.uniform1i(uniforms.iFrame, state.frame);
+  gl.uniform4f(uniforms.iMouse, ...state.mouse);
+  uploadParamsUniforms(params);
+
+  if (isWebGL2) {
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  } else {
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 }
 
@@ -2836,51 +3185,47 @@ function tick(now) {
   const dt = Math.min((now - state.lastTick) / 1000, 0.1);
   state.lastTick = now;
 
+  if (stageExportLock) {
+    requestAnimationFrame(tick);
+    return;
+  }
+
   resizeCanvas();
-  updateMouseLag(dt);
+  const driven = captureIsDriven();
+  if (!driven) {
+    updateMouseLag(dt);
 
-  // Decay pointer speed toward 0 when the cursor isn't moving
-  if (state.pointerSpeed > 0) {
-    state.pointerSpeed *= Math.exp(-dt * DYNAMIC_SPEED_DECAY);
-    if (state.pointerSpeed < 0.001) state.pointerSpeed = 0;
-  }
-
-  if (state.playing) {
-    const rate = params.uDynamicSpeed ? dynamicSpeedFromPointer() : 1;
-    state.shaderTime += dt * rate;
-
-    // FPS: update readout twice a second
-    state.fpsAccumTime += dt;
-    state.fpsAccumFrames += 1;
-    if (state.fpsAccumTime >= 0.5) {
-      state.fps = state.fpsAccumFrames / state.fpsAccumTime;
-      state.fpsAccumTime = 0;
-      state.fpsAccumFrames = 0;
-      fpsReadout.textContent = `${state.fps.toFixed(1)} fps`;
-    }
-    timeReadout.textContent = state.shaderTime.toFixed(2);
-  }
-
-  if (program) {
-    gl.viewport(0, 0, canvas.width, canvas.height);
-    gl.useProgram(program);
-    gl.uniform3f(uniforms.iResolution, canvas.width, canvas.height, 1.0);
-    gl.uniform1f(uniforms.iTime, state.shaderTime);
-    gl.uniform1f(uniforms.iTimeDelta, state.playing ? dt : 0.0);
-    gl.uniform1i(uniforms.iFrame, state.frame);
-    gl.uniform4f(uniforms.iMouse, ...state.mouse);
-
-    if (isWebGL2) {
-      gl.drawArrays(gl.TRIANGLES, 0, 3);
-    } else {
-      gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
-      gl.enableVertexAttribArray(0);
-      gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    // Decay pointer speed toward 0 when the cursor isn't moving
+    if (state.pointerSpeed > 0) {
+      state.pointerSpeed *= Math.exp(-dt * DYNAMIC_SPEED_DECAY);
+      if (state.pointerSpeed < 0.001) state.pointerSpeed = 0;
     }
 
-    if (state.playing) state.frame += 1;
+    if (state.playing) {
+      const rate = params.uDynamicSpeed ? dynamicSpeedFromPointer() : 1;
+      state.shaderTime += dt * rate;
+
+      // FPS: update readout twice a second
+      state.fpsAccumTime += dt;
+      state.fpsAccumFrames += 1;
+      if (state.fpsAccumTime >= 0.5) {
+        state.fps = state.fpsAccumFrames / state.fpsAccumTime;
+        state.fpsAccumTime = 0;
+        state.fpsAccumFrames = 0;
+        fpsReadout.textContent = `${state.fps.toFixed(1)} fps`;
+      }
+      timeReadout.textContent = state.shaderTime.toFixed(2);
+    }
   }
+
+  if (window.PerlinCapture && typeof window.PerlinCapture.onTick === "function") {
+    window.PerlinCapture.onTick(dt);
+  }
+
+  const takePlaying = window.PerlinCapture && typeof window.PerlinCapture.isTakePlaying === "function"
+    && window.PerlinCapture.isTakePlaying();
+  drawFrame((!driven && state.playing) || takePlaying ? dt : 0.0);
+  if (!driven && state.playing) state.frame += 1;
 
   requestAnimationFrame(tick);
 }
@@ -2947,11 +3292,13 @@ function syncMouseFromEvent(e) {
 }
 
 function shouldTrackPointer(e) {
+  if (captureIsDriven()) return false;
   // Desktop hover, active press/drag, or any in-progress touch/pen stroke
   return mouseOver || mouseDown || (e.buttons & 1) === 1 || isTouchLikePointer(e);
 }
 
 canvas.addEventListener("pointerenter", (e) => {
+  if (captureIsDriven()) return;
   mouseOver = true;
   const [x, y] = canvasCoords(e);
   state.mouseTarget[0] = x;
@@ -2978,6 +3325,7 @@ canvas.addEventListener("pointerleave", () => {
 });
 
 canvas.addEventListener("pointerdown", (e) => {
+  if (captureIsDriven()) return;
   if (placingAnchorIndex >= 0 && placingAnchorIndex < params.anchors.length) {
     const [nx, ny] = canvasViewportNorm(e);
     const a = params.anchors[placingAnchorIndex];
@@ -3141,6 +3489,12 @@ function compile(options = {}) {
 
 function syncParamsToEditor() {
   updateSectionSummaries();
+  if (suppressEditorSync) {
+    if (window.PerlinCapture && typeof window.PerlinCapture.onParamsEdited === "function") {
+      window.PerlinCapture.onParamsEdited();
+    }
+    return;
+  }
   const block = buildParamsBlock();
   let code = editor.getValue();
   if (PARAMS_BLOCK_RE.test(code)) {
@@ -3155,8 +3509,11 @@ function syncParamsToEditor() {
   editor.setValue(code);
   editor.setCursor(cursor);
   editor.scrollTo(scroll.left, scroll.top);
-  compile({ quiet: true });
   syncingFromParams = false;
+  if (!usingParamUniforms) compile({ quiet: true });
+  if (window.PerlinCapture && typeof window.PerlinCapture.onParamsEdited === "function") {
+    window.PerlinCapture.onParamsEdited();
+  }
 }
 
 function resetParams() {
@@ -3319,12 +3676,42 @@ divider.addEventListener("pointerdown", (e) => {
   divider.addEventListener("pointerup", onUp);
 });
 
-window.addEventListener("resize", () => editor.refresh());
+window.addEventListener("resize", () => {
+  editor.refresh();
+  resizeCanvas();
+});
 
 /* ============================================================
  * Boot
  * ============================================================ */
 
+window.PerlinStageHost = {
+  canvas,
+  gl,
+  params,
+  state,
+  stageSettings,
+  serializeParams,
+  applySerializedParams,
+  applyParamsToUI,
+  syncParamsToEditor,
+  setPlaying,
+  uploadParamsUniforms,
+  drawFrame,
+  resizeCanvas,
+  refreshStageUI,
+  setSuppressEditorSync: (v) => { suppressEditorSync = !!v; },
+  setExportLock: (v) => { stageExportLock = !!v; },
+  isExportLocked: () => stageExportLock,
+};
+
 syncMobileLayout();
 compile();
+try {
+  if (window.PerlinCapture && typeof window.PerlinCapture.init === "function") {
+    window.PerlinCapture.init(window.PerlinStageHost);
+  }
+} catch (err) {
+  console.error("Stage capture failed to initialize:", err);
+}
 requestAnimationFrame(tick);

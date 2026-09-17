@@ -52,6 +52,17 @@ window.ShaderHarness = (function () {
     };
   }
 
+  /** Convert the editor CONTROLS const block into uniforms, matching app.js. */
+  function rewriteControlsToUniforms(code) {
+    return String(code || "").replace(
+      /\/\/ === CONTROLS BEGIN ===[\s\S]*?\/\/ === CONTROLS END ===/,
+      (block) => block.replace(
+        /const\s+(float|int|vec3)\s+(\w+)\s*=\s*[^;]+;/g,
+        "uniform $1 $2;"
+      )
+    );
+  }
+
   /** Compile + link the wrapped user shader, mirroring buildProgram() in app.js. */
   function buildProgram(gl, isGL2, parts, userShader) {
     const vertSrc = isGL2 ? parts.VERT_SRC_300 : parts.VERT_SRC_100;
@@ -260,6 +271,7 @@ window.ShaderHarness = (function () {
     extractLiteral,
     setConst,
     withConsts,
+    rewriteControlsToUniforms,
     loadSources,
     buildProgram,
     checkProgram,

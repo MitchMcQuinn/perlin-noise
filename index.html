@@ -39,6 +39,12 @@
     <section class="pane pane-preview">
       <div id="canvas-wrap" class="canvas-wrap">
         <canvas id="glcanvas"></canvas>
+        <div id="rec-badge" class="rec-badge" hidden>
+          <span class="rec-dot" aria-hidden="true"></span>
+          REC
+          <span id="rec-timer">0:00</span>
+          <span id="rec-hint" class="rec-hint">Move over the preview</span>
+        </div>
         <div id="fullscreen-hint" class="fullscreen-hint">
           <span class="desktop-only">Press <strong>Esc</strong> to exit fullscreen</span>
           <span class="mobile-only">Tap &#9974; again to exit</span>
@@ -58,6 +64,16 @@
       <div class="toolbar">
         <button id="btn-rewind" class="tb-btn" title="Rewind (reset time)">&#9198;</button>
         <button id="btn-play" class="tb-btn" title="Play / pause">&#9208;</button>
+        <span class="tb-sep"></span>
+        <div class="tb-rec-group" role="group" aria-label="Take recording">
+          <button id="btn-record" class="tb-btn tb-rec" type="button" title="Record a mouse take">
+            Record
+          </button>
+          <button id="btn-rec-pause" class="tb-btn" type="button" hidden title="Pause recording">
+            Pause
+          </button>
+        </div>
+        <button id="btn-timeline" class="tb-btn" type="button" title="Show timeline" hidden>Timeline</button>
         <button id="btn-params-toggle" class="tb-btn" title="Toggle controls" aria-pressed="true">&#9881;</button>
         <button id="btn-fullscreen" class="tb-btn" title="Fullscreen shader (Esc to exit)" aria-pressed="false">&#9974;</button>
         <span id="time-readout" class="tb-stat">0.00</span>
@@ -66,12 +82,58 @@
         <span class="tb-sep desktop-only"></span>
         <span id="res-readout" class="tb-stat desktop-only">0 × 0</span>
       </div>
+      <div id="timeline-dock" class="timeline-dock" hidden>
+        <div class="timeline-header">
+          <div class="timeline-transport">
+            <button id="btn-take-start" class="tb-btn" type="button" title="Jump to start">&#9198;</button>
+            <button id="btn-take-play" class="tb-btn" type="button" title="Play take">&#9654;</button>
+            <span id="take-time-readout" class="tb-stat">0.00 / 0.00</span>
+          </div>
+          <div class="timeline-kf-tools">
+            <label class="timeline-field">
+              <span>Ease</span>
+              <select id="kf-easing" class="param-select">
+                <option value="hold">Hold</option>
+                <option value="linear" selected>Linear</option>
+                <option value="ease">Ease in/out</option>
+              </select>
+            </label>
+            <button id="btn-kf-add" class="btn btn-ghost" type="button" title="Add keyframe at playhead">+ Key</button>
+            <button id="btn-kf-del" class="btn btn-ghost" type="button" title="Delete selected keyframe" disabled>Delete</button>
+          </div>
+          <div class="timeline-export-tools">
+            <button id="btn-take-save" class="btn btn-ghost" type="button">Save JSON</button>
+            <button id="btn-take-load" class="btn btn-ghost" type="button">Load</button>
+            <input id="take-file-input" type="file" accept="application/json,.json" hidden />
+            <button id="btn-export" class="btn btn-primary" type="button">Export</button>
+            <button id="btn-timeline-close" class="btn btn-ghost" type="button" title="Close timeline">&times;</button>
+          </div>
+        </div>
+        <p id="timeline-hint" class="timeline-hint">
+          Play the take, then click the bottom track to add a keyframe and change the look.
+        </p>
+        <div id="timeline-ruler" class="timeline-ruler" role="slider" aria-label="Take playhead" tabindex="0">
+          <div id="timeline-ticks" class="timeline-ticks"></div>
+          <div id="timeline-playhead" class="timeline-playhead"></div>
+        </div>
+        <canvas id="timeline-spark" class="timeline-spark" height="36"></canvas>
+        <div id="timeline-kf-track" class="timeline-kf-track" title="Click to add or select a keyframe"></div>
+      </div>
+      <div id="export-overlay" class="export-overlay" hidden>
+        <div class="export-card">
+          <h3>Exporting</h3>
+          <p id="export-status">Preparing encoder…</p>
+          <div class="export-bar"><div id="export-bar-fill"></div></div>
+          <button id="btn-export-cancel" class="btn" type="button">Cancel</button>
+        </div>
+      </div>
     </section>
   </main>
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/clike/clike.min.js"></script>
   <script src="gradient-math.js"></script>
+  <script src="stage.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
