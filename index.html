@@ -73,6 +73,8 @@
             Pause
           </button>
         </div>
+        <button id="btn-audio" class="tb-btn" type="button" title="Add a soundtrack">Audio</button>
+        <input id="audio-file-input" type="file" accept="audio/*,.mp3,.wav,.ogg,.m4a,.flac,.aac" hidden />
         <button id="btn-timeline" class="tb-btn" type="button" title="Show timeline" hidden>Timeline</button>
         <button id="btn-params-toggle" class="tb-btn" title="Toggle controls" aria-pressed="true">&#9881;</button>
         <button id="btn-fullscreen" class="tb-btn" title="Fullscreen shader (Esc to exit)" aria-pressed="false">&#9974;</button>
@@ -112,11 +114,29 @@
         <p id="timeline-hint" class="timeline-hint">
           Play the take, then click the bottom track to add a keyframe and change the look.
         </p>
+        <div class="timeline-audio-row">
+          <button id="btn-audio-add" class="btn btn-ghost" type="button">Add audio</button>
+          <button id="btn-audio-clear" class="btn btn-ghost" type="button" hidden>Remove</button>
+          <span id="audio-name" class="audio-name">No audio</span>
+          <label class="timeline-field" title="Silence playback; the viz still reacts">
+            <input type="checkbox" id="audio-mute" /> Mute
+          </label>
+          <label class="timeline-field" title="How hard the soundtrack drives the look">
+            Amount
+            <input id="audio-amount" type="range" min="0" max="1" step="0.01" value="0.7" />
+            <span id="audio-amount-val">70%</span>
+          </label>
+          <label class="timeline-field" title="Keep playing and exporting through the end of the track">
+            <input type="checkbox" id="audio-extend" checked /> Fit to audio
+          </label>
+        </div>
+        <div id="audio-toggles" class="audio-toggles" hidden></div>
         <div id="timeline-ruler" class="timeline-ruler" role="slider" aria-label="Take playhead" tabindex="0">
           <div id="timeline-ticks" class="timeline-ticks"></div>
           <div id="timeline-playhead" class="timeline-playhead"></div>
         </div>
         <canvas id="timeline-spark" class="timeline-spark" height="36"></canvas>
+        <canvas id="timeline-wave" class="timeline-wave" height="48" hidden></canvas>
         <div id="timeline-kf-track" class="timeline-kf-track" title="Click to add or select a keyframe"></div>
       </div>
       <div id="export-overlay" class="export-overlay" hidden>

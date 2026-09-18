@@ -183,7 +183,17 @@ function sampleAtTime(samples, t) {
   if (!list.length) return { t, x: 0.5, y: 0.5, on: 0, speed: 0 };
   if (t <= list[0].t) return Object.assign({}, list[0]);
   const last = list[list.length - 1];
-  if (t >= last.t) return Object.assign({}, last);
+  if (t >= last.t) {
+    const extra = t - last.t;
+    return {
+      t,
+      x: last.x,
+      y: last.y,
+      on: last.on,
+      speed: last.speed || 0,
+      time: (last.time != null ? last.time : last.t) + extra,
+    };
+  }
   let lo = 0;
   let hi = list.length - 1;
   while (hi - lo > 1) {
@@ -269,8 +279,274 @@ function formatTakeTime(seconds) {
   return m + ":" + rem.toFixed(2).padStart(5, "0");
 }
 
+const AUDIO_ENV_HZ = 60;
+const AUDIO_WAVE_BINS = 1024;
+
+const AUDIO_PARAM_LIMITS = {
+  uScale: [0.5, 12],
+  uSpeed: [0, 2],
+  uWarp: [0, 4],
+  uContrast: [0.2, 3],
+  uBrightness: [-0.5, 0.5],
+  uHue: [0, 1],
+  u3DRelief: [0, 3],
+  uGeomMotion: [0, 2],
+  uMouseStrength: [0, 1.5],
+};
+
+const AUDIO_REACT_TOGGLES = [
+  { id: "pulseScale", label: "Beat scale", hint: "Kicks punch the noise scale", band: "pulse", key: "uScale", mode: "mul", depth: 0.55 },
+  { id: "bassWarp", label: "Bass warp", hint: "Low end folds the field", band: "bass", key: "uWarp", mode: "add", depth: 1.35 },
+  { id: "levelSpeed", label: "Level speed", hint: "Loudness drives motion", band: "level", key: "uSpeed", mode: "mul", depth: 1.8 },
+  { id: "levelBright", label: "Level glow", hint: "Volume lifts brightness", band: "level", key: "uBrightness", mode: "add", depth: 0.28 },
+  { id: "highHue", label: "Treble hue", hint: "Highs cycle color", band: "high", key: "uHue", mode: "add", depth: 0.35, wrap: true },
+  { id: "midContrast", label: "Mid contrast", hint: "Mids snap the field", band: "mid", key: "uContrast", mode: "mul", depth: 0.7 },
+  { id: "pulseRelief", label: "Beat relief", hint: "Kicks raise 3D height (needs lighting)", band: "pulse", key: "u3DRelief", mode: "add", depth: 1.1 },
+  { id: "bassTravel", label: "Bass travel", hint: "Lows spin camera motion", band: "bass", key: "uGeomMotion", mode: "mul", depth: 1.6 },
+  { id: "levelStrength", label: "Level brush", hint: "Volume pushes mouse strength", band: "level", key: "uMouseStrength", mode: "mul", depth: 1.2 },
+];
+
+function onePoleA(cutoff, sampleRate) {
+  const x = (2 * Math.PI * cutoff) / Math.max(1, sampleRate);
+  return x / (x + 1);
+}
+
+function percentilePeak(arr, p) {
+  const n = arr.length;
+  if (!n) return 1e-8;
+  const copy = Array.prototype.slice.call(arr);
+  copy.sort((a, b) => a - b);
+  const idx = Math.max(0, Math.min(n - 1, Math.floor(p * (n - 1))));
+  return Math.max(1e-8, copy[idx]);
+}
+
+function normalizeEnvelope(arr, p, minPeak) {
+  const peak = Math.max(percentilePeak(arr, p), minPeak || 0, 1e-8);
+  for (let i = 0; i < arr.length; i++) {
+    const v = arr[i] / peak;
+    arr[i] = v < 0 ? 0 : v > 1 ? 1 : v;
+  }
+  return arr;
+}
+
+function mixToMono(buffer) {
+  const n = buffer.length;
+  const chN = Math.max(1, buffer.numberOfChannels);
+  const out = new Float32Array(n);
+  if (chN === 1) {
+    out.set(buffer.getChannelData(0));
+    return out;
+  }
+  for (let c = 0; c < chN; c++) {
+    const ch = buffer.getChannelData(c);
+    for (let i = 0; i < n; i++) out[i] += ch[i];
+  }
+  const inv = 1 / chN;
+  for (let i = 0; i < n; i++) out[i] *= inv;
+  return out;
+}
+
+function envelopesFromMono(samples, sampleRate, fps) {
+  const sr = Math.max(1, sampleRate || 44100);
+  const rate = fps || AUDIO_ENV_HZ;
+  const n = samples && samples.length ? samples.length : 0;
+  const duration = n / sr;
+  const frameCount = Math.max(1, Math.ceil(duration * rate) || 1);
+  const hop = sr / rate;
+  const level = new Float32Array(frameCount);
+  const bass = new Float32Array(frameCount);
+  const mid = new Float32Array(frameCount);
+  const high = new Float32Array(frameCount);
+  const pulse = new Float32Array(frameCount);
+  const bins = AUDIO_WAVE_BINS;
+  const peaks = new Float32Array(bins);
+  const troughs = new Float32Array(bins);
+
+  if (!n) {
+    return { fps: rate, duration: 0, sampleRate: sr, level, bass, mid, high, pulse, peaks, troughs };
+  }
+
+  const aBass = onePoleA(180, sr);
+  const aMid = onePoleA(2500, sr);
+  let lpBass = 0;
+  let lpMid = 0;
+  let accL = 0;
+  let accB = 0;
+  let accM = 0;
+  let accH = 0;
+  let accN = 0;
+  let frame = 0;
+  let nextEnd = hop;
+  let prevBass = 0;
+
+  const binSize = n / bins;
+  let bin = 0;
+  let binEnd = binSize;
+  let binMin = 0;
+  let binMax = 0;
+
+  for (let i = 0; i < n; i++) {
+    const x = samples[i];
+    if (x < binMin) binMin = x;
+    if (x > binMax) binMax = x;
+    if (i + 1 >= binEnd || i === n - 1) {
+      if (bin < bins) {
+        peaks[bin] = binMax;
+        troughs[bin] = binMin;
+        bin += 1;
+      }
+      binMin = 0;
+      binMax = 0;
+      binEnd += binSize;
+    }
+
+    lpBass += aBass * (x - lpBass);
+    lpMid += aMid * (x - lpMid);
+    const b = lpBass;
+    const m = lpMid - lpBass;
+    const h = x - lpMid;
+    accL += x * x;
+    accB += b * b;
+    accM += m * m;
+    accH += h * h;
+    accN += 1;
+
+    if (i + 1 >= nextEnd || i === n - 1) {
+      if (frame < frameCount) {
+        const inv = accN > 0 ? 1 / accN : 0;
+        const B = Math.sqrt(accB * inv);
+        level[frame] = Math.sqrt(accL * inv);
+        bass[frame] = B;
+        mid[frame] = Math.sqrt(accM * inv);
+        high[frame] = Math.sqrt(accH * inv);
+        pulse[frame] = Math.max(0, B - prevBass);
+        prevBass = B;
+        frame += 1;
+      }
+      accL = accB = accM = accH = accN = 0;
+      nextEnd += hop;
+    }
+  }
+
+  while (frame < frameCount) {
+    const src = Math.max(0, frame - 1);
+    level[frame] = level[src];
+    bass[frame] = bass[src];
+    mid[frame] = mid[src];
+    high[frame] = high[src];
+    pulse[frame] = pulse[src];
+    frame += 1;
+  }
+
+  const levelPeak = percentilePeak(level, 0.95);
+  normalizeEnvelope(level, 0.95);
+  normalizeEnvelope(bass, 0.95, levelPeak * 0.2);
+  normalizeEnvelope(mid, 0.95, levelPeak * 0.2);
+  normalizeEnvelope(high, 0.95, levelPeak * 0.2);
+  normalizeEnvelope(pulse, 0.90, levelPeak * 0.05);
+
+  return { fps: rate, duration, sampleRate: sr, level, bass, mid, high, pulse, peaks, troughs };
+}
+
+function lerpArr(arr, i0, i1, u) {
+  const a = arr[i0] || 0;
+  const b = arr[i1] || 0;
+  return a + (b - a) * u;
+}
+
+function envelopeAt(envs, t) {
+  const empty = { level: 0, bass: 0, mid: 0, high: 0, pulse: 0 };
+  if (!envs || !envs.level || !envs.level.length) return empty;
+  const fps = envs.fps || AUDIO_ENV_HZ;
+  const last = envs.level.length - 1;
+  const i = Math.max(0, t) * fps;
+  const i0 = Math.max(0, Math.min(last, Math.floor(i)));
+  const i1 = Math.max(0, Math.min(last, i0 + 1));
+  const u = i0 === i1 ? 0 : i - i0;
+  return {
+    level: lerpArr(envs.level, i0, i1, u),
+    bass: lerpArr(envs.bass, i0, i1, u),
+    mid: lerpArr(envs.mid, i0, i1, u),
+    high: lerpArr(envs.high, i0, i1, u),
+    pulse: lerpArr(envs.pulse, i0, i1, u),
+  };
+}
+
+function defaultAudioReact() {
+  return {
+    amount: 0.7,
+    extendTake: true,
+    maps: {
+      pulseScale: true,
+      bassWarp: true,
+      levelSpeed: true,
+      levelBright: false,
+      highHue: false,
+      midContrast: false,
+      pulseRelief: false,
+      bassTravel: false,
+      levelStrength: false,
+    },
+  };
+}
+
+function mergeAudioReact(raw) {
+  const d = defaultAudioReact();
+  if (!raw || typeof raw !== "object") return d;
+  if (typeof raw.amount === "number" && isFinite(raw.amount)) d.amount = clamp01(raw.amount);
+  if (typeof raw.extendTake === "boolean") d.extendTake = raw.extendTake;
+  if (raw.maps && typeof raw.maps === "object") {
+    for (let i = 0; i < AUDIO_REACT_TOGGLES.length; i++) {
+      const id = AUDIO_REACT_TOGGLES[i].id;
+      if (typeof raw.maps[id] === "boolean") d.maps[id] = raw.maps[id];
+    }
+  }
+  return d;
+}
+
+function clampParamKey(key, value) {
+  const lim = AUDIO_PARAM_LIMITS[key];
+  if (!lim) return value;
+  return Math.max(lim[0], Math.min(lim[1], value));
+}
+
+function applyAudioToParams(params, env, react) {
+  if (!params) return params;
+  if (!env || !react) return cloneJson(params);
+  const amount = clamp01(react.amount == null ? 0.7 : react.amount);
+  const out = cloneJson(params);
+  if (amount <= 1e-6) return out;
+  const maps = react.maps || {};
+  for (let i = 0; i < AUDIO_REACT_TOGGLES.length; i++) {
+    const tog = AUDIO_REACT_TOGGLES[i];
+    if (!maps[tog.id]) continue;
+    const drive = amount * (env[tog.band] || 0);
+    if (drive <= 1e-8) continue;
+    const cur = out[tog.key];
+    if (typeof cur !== "number" || !isFinite(cur)) continue;
+    let next = tog.mode === "mul" ? cur * (1 + tog.depth * drive) : cur + tog.depth * drive;
+    if (tog.wrap) {
+      next = next - Math.floor(next);
+      if (next < 0) next += 1;
+    } else {
+      next = clampParamKey(tog.key, next);
+    }
+    out[tog.key] = next;
+  }
+  return out;
+}
+
+function takeDuration(take, audio, react) {
+  const d = take ? Math.max(0, Number(take.duration) || 0) : 0;
+  const ad = audio && Number(audio.duration) > 0 ? Number(audio.duration) : 0;
+  if (react && react.extendTake !== false && ad > d) return Math.max(ad, 0.001);
+  return Math.max(d, 0.001);
+}
+
 const StageMath = {
   DISCRETE_PARAM_KEYS,
+  AUDIO_REACT_TOGGLES,
+  AUDIO_ENV_HZ,
   cloneJson,
   lerpNum,
   easeUnit,
@@ -283,6 +559,13 @@ const StageMath = {
   outputPixels,
   videoBitrate,
   formatTakeTime,
+  envelopesFromMono,
+  mixToMono,
+  envelopeAt,
+  defaultAudioReact,
+  mergeAudioReact,
+  applyAudioToParams,
+  takeDuration,
 };
 
 const ASPECT_PRESETS = [
@@ -307,6 +590,12 @@ function initCapture(host) {
   let applyingTake = false;
   let exportAbort = false;
   let scrubbing = false;
+  let audioClip = null;
+  let audioReact = defaultAudioReact();
+  let audioMute = false;
+  let audioCtx = null;
+  let audioSource = null;
+  let pendingAudioName = "";
 
   const recBadge = document.getElementById("rec-badge");
   const recTimer = document.getElementById("rec-timer");
@@ -324,19 +613,30 @@ function initCapture(host) {
   const ticksEl = document.getElementById("timeline-ticks");
   const playheadEl = document.getElementById("timeline-playhead");
   const spark = document.getElementById("timeline-spark");
+  const waveEl = document.getElementById("timeline-wave");
   const kfTrack = document.getElementById("timeline-kf-track");
   const overlay = document.getElementById("export-overlay");
   const exportStatus = document.getElementById("export-status");
   const exportBarFill = document.getElementById("export-bar-fill");
   const takeFileInput = document.getElementById("take-file-input");
   const btnTimeline = document.getElementById("btn-timeline");
+  const btnAudio = document.getElementById("btn-audio");
+  const audioFileInput = document.getElementById("audio-file-input");
+  const btnAudioAdd = document.getElementById("btn-audio-add");
+  const btnAudioClear = document.getElementById("btn-audio-clear");
+  const audioNameEl = document.getElementById("audio-name");
+  const audioMuteEl = document.getElementById("audio-mute");
+  const audioAmountEl = document.getElementById("audio-amount");
+  const audioAmountVal = document.getElementById("audio-amount-val");
+  const audioExtendEl = document.getElementById("audio-extend");
+  const audioTogglesEl = document.getElementById("audio-toggles");
 
   function settings() {
     return host.stageSettings;
   }
 
   function duration() {
-    return take ? Math.max(take.duration || 0, 0.001) : 0.001;
+    return takeDuration(take, audioClip, audioReact);
   }
 
   function isDriven() {
@@ -376,13 +676,53 @@ function initCapture(host) {
     st.pointerSpeed = sample.speed || 0;
   }
 
+  function getAudioCtx() {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    if (!audioCtx) audioCtx = new AC();
+    if (audioCtx.state === "suspended") audioCtx.resume();
+    return audioCtx;
+  }
+
+  function stopAudioPlayback() {
+    if (!audioSource) return;
+    try { audioSource.stop(); } catch (_) { /* already stopped */ }
+    try { audioSource.disconnect(); } catch (_) { /* ignore */ }
+    audioSource = null;
+  }
+
+  function startAudioPlayback(fromTime) {
+    stopAudioPlayback();
+    if (audioMute || !audioClip || !audioClip.buffer) return;
+    const ctx = getAudioCtx();
+    if (!ctx) return;
+    const offset = Math.max(0, Math.min(Math.max(0, audioClip.duration - 0.02), fromTime || 0));
+    if (offset >= audioClip.duration) return;
+    const src = ctx.createBufferSource();
+    src.buffer = audioClip.buffer;
+    src.connect(ctx.destination);
+    src.onended = () => {
+      if (audioSource === src) audioSource = null;
+    };
+    try {
+      src.start(0, offset);
+      audioSource = src;
+    } catch (_) {
+      audioSource = null;
+    }
+  }
+
   function applyTakeAt(t, opts) {
     if (!take) return;
     const o = opts || {};
     takeTime = Math.max(0, Math.min(duration(), t));
     applyingTake = true;
     host.setSuppressEditorSync(true);
-    const cfg = paramsAtTime(take.keyframes, takeTime);
+    const base = paramsAtTime(take.keyframes, takeTime);
+    const liveAudio = !!(audioClip && (takePlaying || o.live || host.isExportLocked()));
+    const cfg = liveAudio && base
+      ? applyAudioToParams(base, envelopeAt(audioClip.envelopes, takeTime), audioReact)
+      : base;
     if (cfg) host.applySerializedParams(cfg, { silent: true });
     const sample = sampleAtTime(take.mouse, takeTime);
     applyMouseSample(sample);
@@ -390,6 +730,7 @@ function initCapture(host) {
       ? sample.time
       : (take.shaderTime0 || 0) + takeTime;
     if (!o.silent) {
+      if (base) host.applySerializedParams(base, { silent: true });
       host.setSuppressEditorSync(false);
       host.applyParamsToUI();
       if (o.editor) host.syncParamsToEditor();
@@ -400,6 +741,7 @@ function initCapture(host) {
 
   function parkAt(t) {
     takePlaying = false;
+    stopAudioPlayback();
     applyTakeAt(t, { silent: false, editor: true });
     updateTransportUI();
   }
@@ -418,7 +760,11 @@ function initCapture(host) {
 
   function setRecordingUI(on) {
     if (recBadge) recBadge.hidden = !on;
-    if (recHint) recHint.textContent = interactHint();
+    if (recHint) {
+      recHint.textContent = audioClip
+        ? interactHint() + " · " + audioClip.name
+        : interactHint();
+    }
     if (btnRecord) {
       btnRecord.hidden = false;
       btnRecord.classList.toggle("is-recording", on);
@@ -455,7 +801,7 @@ function initCapture(host) {
     if (playheadEl) playheadEl.style.left = (u * 100).toFixed(3) + "%";
     if (takeTimeReadout) {
       takeTimeReadout.textContent = take
-        ? takeTime.toFixed(2) + " / " + (take.duration || 0).toFixed(2)
+        ? takeTime.toFixed(2) + " / " + duration().toFixed(2)
         : "0.00 / 0.00";
     }
     const timeEl = document.getElementById("time-readout");
@@ -502,6 +848,60 @@ function initCapture(host) {
     ctx.stroke();
   }
 
+  function drawWave() {
+    if (!waveEl) return;
+    const has = !!(audioClip && audioClip.envelopes);
+    waveEl.hidden = !has;
+    if (!has) return;
+    const cssW = Math.max(1, waveEl.clientWidth || waveEl.parentElement.clientWidth || 1);
+    const cssH = 48;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    waveEl.width = Math.floor(cssW * dpr);
+    waveEl.height = Math.floor(cssH * dpr);
+    waveEl.style.width = cssW + "px";
+    waveEl.style.height = cssH + "px";
+    const ctx = waveEl.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssW, cssH);
+    ctx.fillStyle = "#0b1016";
+    ctx.fillRect(0, 0, cssW, cssH);
+    const env = audioClip.envelopes;
+    const midY = cssH * 0.5;
+    const amp = (cssH - 6) * 0.5;
+    const peaks = env.peaks;
+    const troughs = env.troughs;
+    const n = peaks.length;
+    ctx.beginPath();
+    for (let i = 0; i < n; i++) {
+      const x = (i / Math.max(1, n - 1)) * cssW;
+      const y = midY - (peaks[i] || 0) * amp;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    for (let i = n - 1; i >= 0; i--) {
+      const x = (i / Math.max(1, n - 1)) * cssW;
+      const y = midY - (troughs[i] || 0) * amp;
+      ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.fillStyle = "rgba(90, 196, 196, 0.35)";
+    ctx.fill();
+    ctx.beginPath();
+    ctx.strokeStyle = "rgba(255, 138, 42, 0.85)";
+    ctx.lineWidth = 1.25;
+    const bass = env.bass;
+    const bN = bass.length;
+    const dur = Math.max(env.duration || 0.001, duration());
+    for (let i = 0; i < bN; i++) {
+      const t = (i / Math.max(1, env.fps || AUDIO_ENV_HZ));
+      const x = (t / dur) * cssW;
+      const y = cssH - 3 - (bass[i] || 0) * (cssH - 6);
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+
   function renderTicks() {
     if (!ticksEl) return;
     ticksEl.innerHTML = "";
@@ -540,8 +940,10 @@ function initCapture(host) {
     renderTicks();
     renderKeyframes();
     drawSpark();
+    drawWave();
     updatePlayhead();
     updateTransportUI();
+    updateAudioUI();
   }
 
   function openTimeline() {
@@ -558,6 +960,7 @@ function initCapture(host) {
     timelineOpen = false;
     takePlaying = false;
     selectedKf = -1;
+    stopAudioPlayback();
     if (dock) dock.hidden = true;
     if (btnTimeline) btnTimeline.hidden = !take;
     document.body.classList.remove("timeline-open");
@@ -576,17 +979,18 @@ function initCapture(host) {
 
   function addKeyframeAt(t) {
     if (!take) return;
-    const time = Math.max(0, Math.min(take.duration || 0, t));
+    const time = Math.max(0, Math.min(duration(), t));
     const hit = Math.max(0.04, duration() * 0.01);
     const existing = take.keyframes.findIndex((kf) => Math.abs(kf.t - time) <= hit);
     if (existing >= 0) {
       selectKeyframe(existing);
       return;
     }
+    const fromTimeline = paramsAtTime(take.keyframes, time);
     const kf = {
       t: time,
       easing: (kfEasing && kfEasing.value) || "linear",
-      params: host.serializeParams(),
+      params: cloneJson(fromTimeline || host.serializeParams()),
     };
     take.keyframes.push(kf);
     take.keyframes.sort((a, b) => a.t - b.t);
@@ -620,36 +1024,56 @@ function initCapture(host) {
     take.duration = recElapsed;
   }
 
-  function startRecording() {
-    if (recording) return;
-    if (take && !window.confirm("Replace the current take? Unexported keyframes will be lost.")) {
-      return;
-    }
-    takePlaying = false;
-    closeTimeline();
-    recElapsed = 0;
-    takeTime = 0;
-    selectedKf = 0;
+  function takeIsStub() {
+    return !!(take && take.mouse.length <= 1 && take.keyframes.length <= 1);
+  }
+
+  function newEmptyTake(dur) {
     const [aw, ah] = currentAspect();
     const out = currentOutput();
-    take = {
+    return {
       version: 1,
       shaderTime0: host.state.shaderTime,
-      duration: 0,
-      mouse: [],
+      duration: Math.max(0, dur || 0),
+      mouse: [{
+        t: 0,
+        time: host.state.shaderTime,
+        x: 0.5,
+        y: 0.5,
+        on: 0,
+        speed: 0,
+      }],
       keyframes: [{ t: 0, easing: "linear", params: host.serializeParams() }],
       aspect: [aw, ah],
       export: { width: out.width, height: out.height, fps: settings().exportFps },
     };
+  }
+
+  function startRecording() {
+    if (recording) return;
+    if (take && !takeIsStub() && !window.confirm("Replace the current take? Unexported keyframes will be lost.")) {
+      return;
+    }
+    takePlaying = false;
+    stopAudioPlayback();
+    closeTimeline();
+    recElapsed = 0;
+    takeTime = 0;
+    selectedKf = 0;
+    take = newEmptyTake(0);
+    take.mouse = [];
     recording = true;
     setRecordingUI(true);
     updateRecTimer();
     host.setPlaying(true);
+    startAudioPlayback(0);
   }
 
   function pauseRecording() {
     if (!recording) return;
     host.setPlaying(!host.state.playing);
+    if (host.state.playing) startAudioPlayback(recElapsed);
+    else stopAudioPlayback();
     if (btnRecPause) {
       const playing = host.state.playing;
       btnRecPause.title = playing ? "Pause recording" : "Resume recording";
@@ -660,6 +1084,7 @@ function initCapture(host) {
   function stopRecording() {
     if (!recording || !take) return;
     recording = false;
+    stopAudioPlayback();
     take.duration = Math.max(recElapsed, take.mouse.length ? take.mouse[take.mouse.length - 1].t : 1 / 60);
     setRecordingUI(false);
     host.setPlaying(false);
@@ -670,15 +1095,17 @@ function initCapture(host) {
     if (timelineHint) {
       const n = take.mouse.length;
       const secs = (take.duration || 0).toFixed(1);
+      const audioNote = audioClip ? " Soundtrack is on the wave track — toggle how the look follows it." : "";
       timelineHint.textContent = n
-        ? "Captured " + secs + "s. Play the take, then click the bottom track to add a keyframe."
+        ? "Captured " + secs + "s. Play the take, then click the bottom track to add a keyframe." + audioNote
         : "No mouse motion was captured. Record again and move over the preview.";
     }
   }
 
-  function timeFromClientX(clientX) {
-    if (!ruler) return 0;
-    const rect = ruler.getBoundingClientRect();
+  function timeFromClientX(clientX, el) {
+    const node = el || ruler;
+    if (!node) return 0;
+    const rect = node.getBoundingClientRect();
     const u = clamp01((clientX - rect.left) / Math.max(1, rect.width));
     return u * duration();
   }
@@ -686,10 +1113,32 @@ function initCapture(host) {
   function seekFromEvent(e, live) {
     if (!take) return;
     selectedKf = -1;
-    const t = timeFromClientX(e.clientX);
-    if (live) applyTakeAt(t, { silent: true });
+    const t = timeFromClientX(e.clientX, e.currentTarget);
+    if (live) applyTakeAt(t, { silent: true, live: true });
     else parkAt(t);
     renderKeyframes();
+  }
+
+  function bindScrubber(el) {
+    if (!el) return;
+    el.addEventListener("pointerdown", (e) => {
+      if (!take) return;
+      scrubbing = true;
+      takePlaying = false;
+      stopAudioPlayback();
+      try { el.setPointerCapture(e.pointerId); } catch (_) { /* ignore */ }
+      seekFromEvent(e, true);
+    });
+    el.addEventListener("pointermove", (e) => {
+      if (scrubbing) seekFromEvent(e, true);
+    });
+    const endScrub = (e) => {
+      if (!scrubbing) return;
+      scrubbing = false;
+      seekFromEvent(e, false);
+    };
+    el.addEventListener("pointerup", endScrub);
+    el.addEventListener("pointercancel", endScrub);
   }
 
   function serializeTake() {
@@ -704,6 +1153,10 @@ function initCapture(host) {
       duration: take.duration,
       mouse: take.mouse,
       keyframes: take.keyframes,
+      audio: audioClip
+        ? { name: audioClip.name, duration: audioClip.duration }
+        : (pendingAudioName ? { name: pendingAudioName, duration: 0 } : null),
+      audioReact: cloneJson(audioReact),
     };
   }
 
@@ -731,6 +1184,10 @@ function initCapture(host) {
     };
     if (!take.keyframes.length) {
       take.keyframes.push({ t: 0, easing: "linear", params: host.serializeParams() });
+    }
+    audioReact = mergeAudioReact(data.audioReact);
+    if (data.audio && data.audio.name && !audioClip) {
+      pendingAudioName = String(data.audio.name);
     }
     if (Array.isArray(data.aspect) && data.aspect.length >= 2) {
       settings().aspectW = Number(data.aspect[0]) || 16;
@@ -818,17 +1275,42 @@ function initCapture(host) {
     if (host.gl && host.gl.flush) host.gl.flush();
   }
 
-  async function exportMp4(width, height, fps, totalFrames) {
+  async function probeAac(channels, sampleRate) {
+    if (typeof AudioEncoder === "undefined" || !AudioEncoder.isConfigSupported) return null;
+    try {
+      const res = await AudioEncoder.isConfigSupported({
+        codec: "mp4a.40.2",
+        numberOfChannels: channels,
+        sampleRate,
+        bitrate: 160000,
+      });
+      if (res && res.supported) return "mp4a.40.2";
+    } catch (_) {
+      /* unsupported */
+    }
+    return null;
+  }
+
+  async function exportMp4(width, height, fps, totalFrames, takeDur) {
     const { Muxer, ArrayBufferTarget } = await import("https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.1/+esm");
     const codec = await pickAvcCodec(width, height);
     if (!codec) throw new Error("no-h264");
     const target = new ArrayBufferTarget();
+    const wantAudio = !!(audioClip && audioClip.buffer);
+    const audioChannels = wantAudio ? Math.min(2, audioClip.buffer.numberOfChannels) : 0;
+    const audioRate = wantAudio ? audioClip.buffer.sampleRate : 0;
+    const aacCodec = wantAudio && typeof AudioData !== "undefined"
+      ? await probeAac(audioChannels, audioRate)
+      : null;
+    let encoderError = null;
     const muxer = new Muxer({
       target,
       video: { codec: "avc", width, height },
+      audio: aacCodec
+        ? { codec: "aac", numberOfChannels: audioChannels, sampleRate: audioRate }
+        : undefined,
       fastStart: "in-memory",
     });
-    let encoderError = null;
     const encoder = new VideoEncoder({
       output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
       error: (err) => { encoderError = err; },
@@ -844,9 +1326,52 @@ function initCapture(host) {
       latencyMode: "quality",
     });
 
-    function frameFromCanvas(timestamp, duration) {
+    if (aacCodec && typeof AudioEncoder !== "undefined" && typeof AudioData !== "undefined") {
       try {
-        return new VideoFrame(host.canvas, { timestamp, duration, alpha: "discard" });
+        setExportProgress(0, totalFrames, "Encoding soundtrack…");
+        const audioEnc = new AudioEncoder({
+          output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+          error: (err) => { encoderError = err; },
+        });
+        audioEnc.configure({
+          codec: aacCodec,
+          numberOfChannels: audioChannels,
+          sampleRate: audioRate,
+          bitrate: 160000,
+        });
+        const buffer = audioClip.buffer;
+        const endFrame = Math.min(buffer.length, Math.max(1, Math.floor(takeDur * audioRate)));
+        const hop = 2048;
+        for (let offset = 0; offset < endFrame; offset += hop) {
+          if (exportAbort) throw new Error("cancelled");
+          if (encoderError) throw encoderError;
+          const count = Math.min(hop, endFrame - offset);
+          const packed = new Float32Array(count * audioChannels);
+          for (let c = 0; c < audioChannels; c++) {
+            packed.set(buffer.getChannelData(c).subarray(offset, offset + count), c * count);
+          }
+          const data = new AudioData({
+            format: "f32-planar",
+            sampleRate: audioRate,
+            numberOfFrames: count,
+            numberOfChannels: audioChannels,
+            timestamp: Math.round((offset / audioRate) * 1e6),
+            data: packed,
+          });
+          audioEnc.encode(data);
+          data.close();
+        }
+        await audioEnc.flush();
+        audioEnc.close();
+      } catch (err) {
+        if (err && err.message === "cancelled") throw err;
+        encoderError = null;
+      }
+    }
+
+    function frameFromCanvas(timestamp, durationUs) {
+      try {
+        return new VideoFrame(host.canvas, { timestamp, duration: durationUs, alpha: "discard" });
       } catch (_) {
         const w = host.canvas.width;
         const h = host.canvas.height;
@@ -862,7 +1387,7 @@ function initCapture(host) {
           codedWidth: w,
           codedHeight: h,
           timestamp,
-          duration,
+          duration: durationUs,
         });
       }
     }
@@ -871,7 +1396,7 @@ function initCapture(host) {
     for (let i = 0; i < totalFrames; i++) {
       if (exportAbort) throw new Error("cancelled");
       if (encoderError) throw encoderError;
-      const t = Math.min(take.duration, i / fps);
+      const t = Math.min(takeDur, i / fps);
       renderExportFrame(t, dt);
       const frame = frameFromCanvas(
         Math.round((i * 1e6) / fps),
@@ -921,7 +1446,7 @@ function initCapture(host) {
         track.stop();
         throw new Error("cancelled");
       }
-      const t = Math.min(take.duration, i / fps);
+      const t = Math.min(duration(), i / fps);
       renderExportFrame(t, dt);
       if (track.requestFrame) track.requestFrame();
       setExportProgress(i + 1, totalFrames, "Encoding WebM " + (i + 1) + " / " + totalFrames);
@@ -938,7 +1463,8 @@ function initCapture(host) {
     exportAbort = false;
     const out = currentOutput();
     const fps = settings().exportFps || 60;
-    const totalFrames = Math.max(1, Math.round((take.duration || 0) * fps) || 1);
+    const takeDur = duration();
+    const totalFrames = Math.max(1, Math.round(takeDur * fps) || 1);
     const prevW = host.canvas.width;
     const prevH = host.canvas.height;
     if (overlay) overlay.hidden = false;
@@ -952,7 +1478,7 @@ function initCapture(host) {
     let ext = "mp4";
     try {
       try {
-        blob = await exportMp4(out.width, out.height, fps, totalFrames);
+        blob = await exportMp4(out.width, out.height, fps, totalFrames, takeDur);
         ext = "mp4";
       } catch (err) {
         if (err && err.message === "cancelled") throw err;
@@ -990,8 +1516,8 @@ function initCapture(host) {
     }
     if (takePlaying && take) {
       takeTime += dt;
-      if (takeTime >= take.duration) {
-        takeTime = take.duration;
+      if (takeTime >= duration()) {
+        takeTime = duration();
         takePlaying = false;
         parkAt(takeTime);
         return;
@@ -1005,6 +1531,108 @@ function initCapture(host) {
     if (applyingTake || recording || !take || selectedKf < 0) return;
     take.keyframes[selectedKf].params = host.serializeParams();
   }
+
+  function updateAudioUI() {
+    const has = !!audioClip;
+    if (btnAudioClear) btnAudioClear.hidden = !has;
+    if (audioTogglesEl) audioTogglesEl.hidden = !has;
+    if (audioNameEl) {
+      if (has) audioNameEl.textContent = audioClip.name;
+      else if (pendingAudioName) audioNameEl.textContent = "Re-add “" + pendingAudioName + "”";
+      else audioNameEl.textContent = "No audio";
+    }
+    if (audioAmountEl) audioAmountEl.value = String(audioReact.amount);
+    if (audioAmountVal) audioAmountVal.textContent = Math.round(audioReact.amount * 100) + "%";
+    if (audioExtendEl) audioExtendEl.checked = audioReact.extendTake !== false;
+    if (audioMuteEl) audioMuteEl.checked = !!audioMute;
+    if (audioTogglesEl) {
+      const boxes = audioTogglesEl.querySelectorAll("input[data-react-id]");
+      for (let i = 0; i < boxes.length; i++) {
+        const box = boxes[i];
+        const id = box.getAttribute("data-react-id");
+        box.checked = !!(audioReact.maps && audioReact.maps[id]);
+        const lab = box.closest(".audio-toggle");
+        if (lab) lab.classList.toggle("is-on", box.checked);
+      }
+    }
+  }
+
+  function previewAudioAtPlayhead() {
+    if (!take || selectedKf >= 0 || recording) return;
+    applyTakeAt(takeTime, { silent: true, live: true });
+  }
+
+  function buildAudioToggles() {
+    if (!audioTogglesEl) return;
+    audioTogglesEl.innerHTML = "";
+    for (let i = 0; i < AUDIO_REACT_TOGGLES.length; i++) {
+      const tog = AUDIO_REACT_TOGGLES[i];
+      const lab = document.createElement("label");
+      lab.className = "audio-toggle";
+      lab.title = tog.hint;
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.setAttribute("data-react-id", tog.id);
+      box.checked = !!(audioReact.maps && audioReact.maps[tog.id]);
+      lab.classList.toggle("is-on", box.checked);
+      box.addEventListener("change", () => {
+        audioReact.maps[tog.id] = box.checked;
+        lab.classList.toggle("is-on", box.checked);
+        previewAudioAtPlayhead();
+      });
+      lab.appendChild(box);
+      lab.appendChild(document.createTextNode(tog.label));
+      audioTogglesEl.appendChild(lab);
+    }
+  }
+
+  async function loadAudioFile(file) {
+    if (!file) return;
+    const ctx = getAudioCtx();
+    if (!ctx) {
+      window.alert("This browser cannot decode audio.");
+      return;
+    }
+    try {
+      const arr = await file.arrayBuffer();
+      const buffer = await ctx.decodeAudioData(arr.slice(0));
+      const mono = mixToMono(buffer);
+      const envelopes = envelopesFromMono(mono, buffer.sampleRate, AUDIO_ENV_HZ);
+      audioClip = {
+        name: file.name,
+        duration: buffer.duration,
+        sampleRate: buffer.sampleRate,
+        buffer,
+        envelopes,
+      };
+      pendingAudioName = "";
+      if (!take) {
+        take = newEmptyTake(audioClip.duration);
+        selectedKf = 0;
+      }
+      openTimeline();
+      refreshTimeline();
+      if (timelineHint) {
+        timelineHint.textContent = "Soundtrack loaded. Play to hear it, then toggle how the look follows the mix. Record a mouse take over it when you are ready.";
+      }
+    } catch (_) {
+      window.alert("Could not decode that audio file.");
+    }
+  }
+
+  function clearAudio() {
+    stopAudioPlayback();
+    audioClip = null;
+    pendingAudioName = "";
+    refreshTimeline();
+  }
+
+  function pickAudioFile() {
+    if (audioFileInput) audioFileInput.click();
+  }
+
+  buildAudioToggles();
+  updateAudioUI();
 
   if (btnRecord) {
     btnRecord.addEventListener("click", () => {
@@ -1020,9 +1648,10 @@ function initCapture(host) {
         parkAt(takeTime);
         return;
       }
-      if (takeTime >= take.duration - 1e-4) takeTime = 0;
+      if (takeTime >= duration() - 1e-4) takeTime = 0;
       selectedKf = -1;
       takePlaying = true;
+      startAudioPlayback(takeTime);
       host.state.lastTick = performance.now();
       updateTransportUI();
       renderKeyframes();
@@ -1069,26 +1698,47 @@ function initCapture(host) {
   const btnTimelineClose = document.getElementById("btn-timeline-close");
   if (btnTimelineClose) btnTimelineClose.addEventListener("click", closeTimeline);
   if (btnTimeline) btnTimeline.addEventListener("click", () => { if (take) openTimeline(); });
-
-  if (ruler) {
-    ruler.addEventListener("pointerdown", (e) => {
-      if (!take) return;
-      scrubbing = true;
-      takePlaying = false;
-      try { ruler.setPointerCapture(e.pointerId); } catch (_) { /* ignore */ }
-      seekFromEvent(e, true);
+  if (btnAudio) {
+    btnAudio.addEventListener("click", () => {
+      if (audioClip && take) openTimeline();
+      else pickAudioFile();
     });
-    ruler.addEventListener("pointermove", (e) => {
-      if (scrubbing) seekFromEvent(e, true);
-    });
-    const endScrub = (e) => {
-      if (!scrubbing) return;
-      scrubbing = false;
-      seekFromEvent(e, false);
-    };
-    ruler.addEventListener("pointerup", endScrub);
-    ruler.addEventListener("pointercancel", endScrub);
   }
+  if (btnAudioAdd) btnAudioAdd.addEventListener("click", pickAudioFile);
+  if (btnAudioClear) btnAudioClear.addEventListener("click", clearAudio);
+  if (audioFileInput) {
+    audioFileInput.addEventListener("change", () => {
+      const file = audioFileInput.files && audioFileInput.files[0];
+      audioFileInput.value = "";
+      getAudioCtx();
+      loadAudioFile(file);
+    });
+  }
+  if (audioMuteEl) {
+    audioMuteEl.addEventListener("change", () => {
+      audioMute = !!audioMuteEl.checked;
+      if (audioMute || !takePlaying) stopAudioPlayback();
+      else if (takePlaying) startAudioPlayback(takeTime);
+    });
+  }
+  if (audioAmountEl) {
+    audioAmountEl.addEventListener("input", () => {
+      audioReact.amount = clamp01(Number(audioAmountEl.value) || 0);
+      if (audioAmountVal) audioAmountVal.textContent = Math.round(audioReact.amount * 100) + "%";
+      previewAudioAtPlayhead();
+    });
+  }
+  if (audioExtendEl) {
+    audioExtendEl.addEventListener("change", () => {
+      audioReact.extendTake = !!audioExtendEl.checked;
+      if (takeTime > duration()) takeTime = duration();
+      refreshTimeline();
+    });
+  }
+
+  bindScrubber(ruler);
+  bindScrubber(waveEl);
+  bindScrubber(spark);
 
   if (kfTrack) {
     kfTrack.addEventListener("click", (e) => {
@@ -1101,7 +1751,10 @@ function initCapture(host) {
   }
 
   window.addEventListener("resize", () => {
-    if (timelineOpen) drawSpark();
+    if (timelineOpen) {
+      drawSpark();
+      drawWave();
+    }
   });
 
   host.PerlinCaptureAPI = {

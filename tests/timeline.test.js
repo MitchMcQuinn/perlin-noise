@@ -173,4 +173,75 @@ test("evenDim and bitrate stay in encoder-friendly ranges", () => {
   assert.ok(rate >= 8e6 && rate <= 80e6);
 });
 
+function sineMono(freq, sr, dur) {
+  const n = Math.floor(sr * dur);
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) out[i] = Math.sin(2 * Math.PI * freq * i / sr);
+  return out;
+}
+
+test("envelopes put 80Hz energy in bass and 8kHz in highs", () => {
+  const sr = 44100;
+  const low = StageMath.envelopesFromMono(sineMono(80, sr, 0.4), sr, 60);
+  const high = StageMath.envelopesFromMono(sineMono(8000, sr, 0.4), sr, 60);
+  const midLow = Math.floor(low.bass.length / 2);
+  const midHigh = Math.floor(high.high.length / 2);
+  assert.ok(low.bass[midLow] > 0.6, "bass sine should read as bass");
+  assert.ok(low.high[midLow] < 0.35, "bass sine should not read as treble");
+  assert.ok(high.high[midHigh] > 0.6, "treble sine should read as highs");
+  assert.ok(high.bass[midHigh] < 0.35, "treble sine should not read as bass");
+  assert.ok(low.peaks.length === 1024);
+});
+
+test("envelopeAt interpolates neighboring frames", () => {
+  const env = {
+    fps: 10,
+    level: new Float32Array([0, 1]),
+    bass: new Float32Array([0, 0.5]),
+    mid: new Float32Array([0, 0]),
+    high: new Float32Array([0, 0]),
+    pulse: new Float32Array([0, 0]),
+  };
+  const mid = StageMath.envelopeAt(env, 0.05);
+  assert.ok(Math.abs(mid.level - 0.5) < 1e-9);
+  assert.ok(Math.abs(mid.bass - 0.25) < 1e-9);
+  const empty = StageMath.envelopeAt(null, 0);
+  assert.strictEqual(empty.level, 0);
+});
+
+test("applyAudioToParams follows enabled maps and amount", () => {
+  const base = baseParams({ uScale: 2, uWarp: 1, uSpeed: 0.25, uHue: 0.9, uBrightness: 0 });
+  const env = { level: 1, bass: 1, mid: 0, high: 1, pulse: 1 };
+  const off = StageMath.applyAudioToParams(base, env, { amount: 0.7, maps: {} });
+  assert.strictEqual(off.uScale, 2);
+  const react = StageMath.mergeAudioReact({
+    amount: 1,
+    maps: { pulseScale: true, bassWarp: true, highHue: true, levelSpeed: false },
+  });
+  const out = StageMath.applyAudioToParams(base, env, react);
+  assert.ok(out.uScale > 2, "beat scale should grow");
+  assert.ok(out.uWarp > 1, "bass warp should add");
+  assert.ok(out.uHue < 0.9, "treble hue should wrap past 1");
+  assert.strictEqual(out.uSpeed, 0.25);
+  const muted = StageMath.applyAudioToParams(base, env, { amount: 0, maps: react.maps });
+  assert.strictEqual(muted.uScale, 2);
+});
+
+test("takeDuration extends to audio when Fit to audio is on", () => {
+  const take = { duration: 3 };
+  const audio = { duration: 12 };
+  assert.strictEqual(StageMath.takeDuration(take, audio, { extendTake: true }), 12);
+  assert.strictEqual(StageMath.takeDuration(take, audio, { extendTake: false }), 3);
+  assert.strictEqual(StageMath.takeDuration(take, null, { extendTake: true }), 3);
+});
+
+test("mouse samples keep moving shader time after the last capture", () => {
+  const after = StageMath.sampleAtTime([
+    { t: 0, time: 10, x: 0, y: 0, on: 1, speed: 0 },
+    { t: 2, time: 14, x: 1, y: 1, on: 1, speed: 0 },
+  ], 5);
+  assert.strictEqual(after.x, 1);
+  assert.ok(Math.abs(after.time - 17) < 1e-9);
+});
+
 if (!process.exitCode) console.log(`\n${passed} passed`);
