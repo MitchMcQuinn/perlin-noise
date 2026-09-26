@@ -139,6 +139,15 @@ test("mouse samples lerp position and keep on-flag from the earlier sample", () 
   assert.ok(Math.abs(timed.time - 12) < 1e-9);
 });
 
+test("fullscreen preview fills the wrap instead of letterboxing", () => {
+  const fit = StageMath.previewSize(390, 700, 16, 9, true);
+  assert.strictEqual(fit.width, 390);
+  assert.strictEqual(fit.height, 700);
+  const boxed = StageMath.previewSize(390, 700, 16, 9, false);
+  assert.ok(boxed.width < 390 || boxed.height < 700);
+  assert.ok(Math.abs(boxed.width / boxed.height - 16 / 9) < 0.01);
+});
+
 test("letterbox fits the aspect inside the wrap", () => {
   const landscape = StageMath.letterboxSize(1920, 1080, 16, 9);
   assert.ok(Math.abs(landscape.width - 1920) < 0.5);

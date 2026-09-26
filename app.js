@@ -1007,12 +1007,13 @@ params.positions = evenPositions(MAX_STOPS);
 params.anchors = [];
 
 const STAGE_ASPECT_PRESETS = [
-  { id: "16:9", w: 16, h: 9 },
-  { id: "16:10", w: 16, h: 10 },
-  { id: "4:3", w: 4, h: 3 },
-  { id: "1:1", w: 1, h: 1 },
-  { id: "9:16", w: 9, h: 16 },
-  { id: "custom", w: 16, h: 9 },
+  { id: "16:9", label: "16:9", w: 16, h: 9 },
+  { id: "16:10", label: "16:10", w: 16, h: 10 },
+  { id: "4:3", label: "4:3", w: 4, h: 3 },
+  { id: "1:1", label: "1:1", w: 1, h: 1 },
+  { id: "9:16", label: "9:16", w: 9, h: 16 },
+  { id: "fullscreen", label: "Fullscreen", fill: true },
+  { id: "custom", label: "Custom", w: 16, h: 9 },
 ];
 
 const stageSettings = {
@@ -1594,7 +1595,10 @@ function updateSectionSummaries() {
   const out = (typeof StageMath !== "undefined" && StageMath.outputPixels)
     ? StageMath.outputPixels(s.aspectW, s.aspectH, s.outputPreset, s.customW, s.customH)
     : { width: 1920, height: 1080 };
-  set("stage", `${s.aspectW}:${s.aspectH} \u00b7 ${out.width}\u00d7${out.height}`);
+  const aspectLabel = s.aspectPreset === "fullscreen"
+    ? "fullscreen"
+    : `${s.aspectW}:${s.aspectH}`;
+  set("stage", `${aspectLabel} \u00b7 ${out.width}\u00d7${out.height}`);
 
   set("noise", `scale ${Number(params.uScale).toFixed(1)} \u00b7 ${params.uOctaves} oct`);
   set("threed", params.u3D ? "on" : "off");
@@ -2850,16 +2854,16 @@ function applyStageAspectFromUI() {
   if (id === "custom") {
     stageSettings.aspectW = Math.max(1, Number(stageSettings.customAspectW) || 16);
     stageSettings.aspectH = Math.max(1, Number(stageSettings.customAspectH) || 9);
-  } else {
+  } else if (!preset.fill) {
     stageSettings.aspectW = preset.w;
     stageSettings.aspectH = preset.h;
   }
   if (stageCustomAspect) stageCustomAspect.hidden = id !== "custom";
   if (stageCustomOutput) stageCustomOutput.hidden = stageSettings.outputPreset !== "custom";
+  resizeCanvas();
   const out = currentOutputPixels();
   if (stageOutReadout) stageOutReadout.textContent = `${out.width} \u00d7 ${out.height}`;
   updateSectionSummaries();
-  resizeCanvas();
 }
 
 function refreshStageUI() {
@@ -2905,7 +2909,7 @@ function buildStageSection() {
   stageAspectSelect = document.createElement("select");
   stageAspectSelect.className = "param-select";
   stageAspectSelect.innerHTML = STAGE_ASPECT_PRESETS.map(
-    (p) => `<option value="${p.id}">${p.id}</option>`
+    (p) => `<option value="${p.id}">${p.label || p.id}</option>`
   ).join("");
   stageAspectSelect.value = stageSettings.aspectPreset;
   stageAspectSelect.addEventListener("change", applyStageAspectFromUI);
@@ -2983,7 +2987,7 @@ function buildStageSection() {
 
   const hint = document.createElement("p");
   hint.className = "param-hint";
-  hint.textContent = "Locks the preview to the projection frame. 1080p uses 1080 on the short edge (16:9 \u2192 1920\u00d71080, 9:16 \u2192 1080\u00d71920).";
+  hint.textContent = "Locks the preview to the projection frame. Fullscreen uses this screen and fills the preview. 1080p uses 1080 on the short edge (16:9 \u2192 1920\u00d71080, 9:16 \u2192 1080\u00d71920).";
   body.appendChild(hint);
 
   applyStageAspectFromUI();
@@ -3082,8 +3086,19 @@ function resizeCanvas() {
   const wrapH = wrap ? wrap.clientHeight : 0;
   if (wrapW < 2 || wrapH < 2) return;
 
-  const fit = (typeof StageMath !== "undefined" && StageMath.letterboxSize)
-    ? StageMath.letterboxSize(wrapW, wrapH, stageSettings.aspectW, stageSettings.aspectH)
+  const fill = stageSettings.aspectPreset === "fullscreen";
+  if (fill) {
+    const changed = stageSettings.aspectW !== wrapW || stageSettings.aspectH !== wrapH;
+    stageSettings.aspectW = wrapW;
+    stageSettings.aspectH = wrapH;
+    if (changed) {
+      const out = currentOutputPixels();
+      if (stageOutReadout) stageOutReadout.textContent = `${out.width} \u00d7 ${out.height}`;
+      updateSectionSummaries();
+    }
+  }
+  const fit = (typeof StageMath !== "undefined" && StageMath.previewSize)
+    ? StageMath.previewSize(wrapW, wrapH, stageSettings.aspectW, stageSettings.aspectH, fill)
     : { width: wrapW, height: wrapH };
   const cssW = Math.max(1, fit.width);
   const cssH = Math.max(1, fit.height);
@@ -3631,6 +3646,7 @@ function setFullscreen(on) {
     fullscreenHint.classList.remove("show");
   }
   editor.refresh();
+  resizeCanvas();
 }
 
 document.getElementById("btn-fullscreen").addEventListener("click", () => {
@@ -3671,6 +3687,7 @@ divider.addEventListener("pointerdown", (e) => {
     const pct = ((ev.clientX - total.left) / total.width) * 100;
     editorPane.style.flexBasis = Math.min(80, Math.max(15, pct)) + "%";
     editor.refresh();
+    resizeCanvas();
   };
   const onUp = () => {
     divider.classList.remove("dragging");

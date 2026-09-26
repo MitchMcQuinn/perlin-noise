@@ -234,6 +234,11 @@ function letterboxSize(wrapW, wrapH, aspectW, aspectH) {
   return { width, height: width / targetA };
 }
 
+function previewSize(wrapW, wrapH, aspectW, aspectH, fill) {
+  if (fill) return { width: Math.max(1, wrapW), height: Math.max(1, wrapH) };
+  return letterboxSize(wrapW, wrapH, aspectW, aspectH);
+}
+
 function evenDim(n) {
   const v = Math.round(n);
   return Math.max(2, v - (v % 2));
@@ -555,6 +560,7 @@ const StageMath = {
   paramsAtTime,
   sampleAtTime,
   letterboxSize,
+  previewSize,
   evenDim,
   outputPixels,
   videoBitrate,
@@ -574,6 +580,7 @@ const ASPECT_PRESETS = [
   { id: "4:3", w: 4, h: 3 },
   { id: "1:1", w: 1, h: 1 },
   { id: "9:16", w: 9, h: 16 },
+  { id: "fullscreen", fill: true },
   { id: "custom", w: 16, h: 9 },
 ];
 
@@ -1148,6 +1155,7 @@ function initCapture(host) {
     return {
       version: 1,
       aspect: [aw, ah],
+      aspectPreset: settings().aspectPreset,
       export: { width: out.width, height: out.height, fps: settings().exportFps },
       shaderTime0: take.shaderTime0,
       duration: take.duration,
@@ -1189,11 +1197,13 @@ function initCapture(host) {
     if (data.audio && data.audio.name && !audioClip) {
       pendingAudioName = String(data.audio.name);
     }
-    if (Array.isArray(data.aspect) && data.aspect.length >= 2) {
+    if (data.aspectPreset === "fullscreen") {
+      settings().aspectPreset = "fullscreen";
+    } else if (Array.isArray(data.aspect) && data.aspect.length >= 2) {
       settings().aspectW = Number(data.aspect[0]) || 16;
       settings().aspectH = Number(data.aspect[1]) || 9;
       const match = ASPECT_PRESETS.find(
-        (p) => p.id !== "custom" && p.w === settings().aspectW && p.h === settings().aspectH
+        (p) => !p.fill && p.id !== "custom" && p.w === settings().aspectW && p.h === settings().aspectH
       );
       settings().aspectPreset = match ? match.id : "custom";
       if (!match) {
