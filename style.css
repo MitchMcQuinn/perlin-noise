@@ -207,6 +207,10 @@ body.fullscreen .fullscreen-hint.show {
   opacity: 1;
 }
 
+.fullscreen-exit {
+  display: none;
+}
+
 /* ---------- Preview ---------- */
 
 .canvas-wrap {
@@ -1380,6 +1384,37 @@ body.fullscreen .fullscreen-hint.show {
     min-width: 40px;
     min-height: 36px;
     font-size: 16px;
+  }
+
+  body.fullscreen .fullscreen-hint {
+    left: max(12px, env(safe-area-inset-left));
+    right: auto;
+    transform: none;
+    top: max(12px, env(safe-area-inset-top));
+  }
+
+  body.fullscreen .fullscreen-exit {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    position: absolute;
+    z-index: 25;
+    top: max(12px, env(safe-area-inset-top));
+    right: max(12px, env(safe-area-inset-right));
+    min-width: 44px;
+    min-height: 44px;
+    padding: 8px 16px;
+    border: 1px solid rgba(255, 255, 255, 0.35);
+    border-radius: 999px;
+    background: rgba(0, 0, 0, 0.62);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+    color: #fff;
+    font-family: var(--font-ui);
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
   }
 
   body.fullscreen .mobile-nav {

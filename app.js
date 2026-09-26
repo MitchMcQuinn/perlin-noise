@@ -3637,6 +3637,11 @@ document.getElementById("btn-fullscreen").addEventListener("click", () => {
   setFullscreen(!document.body.classList.contains("fullscreen"));
 });
 
+document.getElementById("btn-fullscreen-exit").addEventListener("click", (e) => {
+  e.stopPropagation();
+  setFullscreen(false);
+});
+
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && document.body.classList.contains("fullscreen")) {
     setFullscreen(false);
