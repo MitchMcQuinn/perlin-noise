@@ -2749,6 +2749,9 @@ function exportPresetToFile(preset) {
 }
 
 function renderPresetsList() {
+  if (window.PerlinBooth && typeof window.PerlinBooth.refreshScenes === "function") {
+    window.PerlinBooth.refreshScenes();
+  }
   if (!presetsHostEl) return;
   const list = loadPresets();
   presetsHostEl.innerHTML = "";
@@ -3127,14 +3130,22 @@ function captureIsDriven() {
 function drawFrame(dt) {
   if (!program) return;
   const timeDelta = dt == null ? 0 : dt;
-  gl.viewport(0, 0, canvas.width, canvas.height);
+  const booth = window.PerlinBooth;
+  const frameParams = booth && typeof booth.frameParams === "function"
+    ? (booth.frameParams(params) || params)
+    : params;
+  const target = booth && typeof booth.beginScene === "function" ? booth.beginScene() : null;
+  const viewW = target ? target.width : canvas.width;
+  const viewH = target ? target.height : canvas.height;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, target ? target.framebuffer : null);
+  gl.viewport(0, 0, viewW, viewH);
   gl.useProgram(program);
-  gl.uniform3f(uniforms.iResolution, canvas.width, canvas.height, 1.0);
+  gl.uniform3f(uniforms.iResolution, viewW, viewH, 1.0);
   gl.uniform1f(uniforms.iTime, state.shaderTime);
   gl.uniform1f(uniforms.iTimeDelta, timeDelta);
   gl.uniform1i(uniforms.iFrame, state.frame);
   gl.uniform4f(uniforms.iMouse, ...state.mouse);
-  uploadParamsUniforms(params);
+  uploadParamsUniforms(frameParams);
 
   if (isWebGL2) {
     gl.drawArrays(gl.TRIANGLES, 0, 3);
@@ -3143,6 +3154,11 @@ function drawFrame(dt) {
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+  try {
+    if (target && booth && typeof booth.composite === "function") booth.composite();
+  } finally {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 }
 
@@ -3197,52 +3213,59 @@ function updateMouseLag(dt) {
 }
 
 function tick(now) {
-  const dt = Math.min((now - state.lastTick) / 1000, 0.1);
-  state.lastTick = now;
+  try {
+    const dt = Math.min((now - state.lastTick) / 1000, 0.1);
+    state.lastTick = now;
 
-  if (stageExportLock) {
-    requestAnimationFrame(tick);
-    return;
-  }
+    if (stageExportLock) return;
 
-  resizeCanvas();
-  const driven = captureIsDriven();
-  if (!driven) {
-    updateMouseLag(dt);
+    resizeCanvas();
+    const driven = captureIsDriven();
+    if (!driven) {
+      updateMouseLag(dt);
 
-    // Decay pointer speed toward 0 when the cursor isn't moving
-    if (state.pointerSpeed > 0) {
-      state.pointerSpeed *= Math.exp(-dt * DYNAMIC_SPEED_DECAY);
-      if (state.pointerSpeed < 0.001) state.pointerSpeed = 0;
-    }
-
-    if (state.playing) {
-      const rate = params.uDynamicSpeed ? dynamicSpeedFromPointer() : 1;
-      state.shaderTime += dt * rate;
-
-      // FPS: update readout twice a second
-      state.fpsAccumTime += dt;
-      state.fpsAccumFrames += 1;
-      if (state.fpsAccumTime >= 0.5) {
-        state.fps = state.fpsAccumFrames / state.fpsAccumTime;
-        state.fpsAccumTime = 0;
-        state.fpsAccumFrames = 0;
-        fpsReadout.textContent = `${state.fps.toFixed(1)} fps`;
+      // Decay pointer speed toward 0 when the cursor isn't moving
+      if (state.pointerSpeed > 0) {
+        state.pointerSpeed *= Math.exp(-dt * DYNAMIC_SPEED_DECAY);
+        if (state.pointerSpeed < 0.001) state.pointerSpeed = 0;
       }
-      timeReadout.textContent = state.shaderTime.toFixed(2);
+
+      if (state.playing) {
+        const rate = params.uDynamicSpeed ? dynamicSpeedFromPointer() : 1;
+        state.shaderTime += dt * rate;
+
+        // FPS: update readout twice a second
+        state.fpsAccumTime += dt;
+        state.fpsAccumFrames += 1;
+        if (state.fpsAccumTime >= 0.5) {
+          state.fps = state.fpsAccumFrames / state.fpsAccumTime;
+          state.fpsAccumTime = 0;
+          state.fpsAccumFrames = 0;
+          fpsReadout.textContent = `${state.fps.toFixed(1)} fps`;
+        }
+        timeReadout.textContent = state.shaderTime.toFixed(2);
+      }
     }
+
+    if (window.PerlinCapture && typeof window.PerlinCapture.onTick === "function") {
+      window.PerlinCapture.onTick(dt);
+    }
+    if (window.PerlinBooth && typeof window.PerlinBooth.beforeFrame === "function") {
+      window.PerlinBooth.beforeFrame(dt);
+    }
+
+    const takePlaying = window.PerlinCapture && typeof window.PerlinCapture.isTakePlaying === "function"
+      && window.PerlinCapture.isTakePlaying();
+    drawFrame((!driven && state.playing) || takePlaying ? dt : 0.0);
+    if (window.PerlinBooth && typeof window.PerlinBooth.afterFrame === "function") {
+      window.PerlinBooth.afterFrame();
+    }
+    if (!driven && state.playing) state.frame += 1;
+  } catch (err) {
+    console.error("Frame failed:", err);
+  } finally {
+    requestAnimationFrame(tick);
   }
-
-  if (window.PerlinCapture && typeof window.PerlinCapture.onTick === "function") {
-    window.PerlinCapture.onTick(dt);
-  }
-
-  const takePlaying = window.PerlinCapture && typeof window.PerlinCapture.isTakePlaying === "function"
-    && window.PerlinCapture.isTakePlaying();
-  drawFrame((!driven && state.playing) || takePlaying ? dt : 0.0);
-  if (!driven && state.playing) state.frame += 1;
-
-  requestAnimationFrame(tick);
 }
 
 /* ============================================================
@@ -3725,6 +3748,7 @@ window.PerlinStageHost = {
   setSuppressEditorSync: (v) => { suppressEditorSync = !!v; },
   setExportLock: (v) => { stageExportLock = !!v; },
   isExportLocked: () => stageExportLock,
+  loadPresets,
 };
 
 syncMobileLayout();
@@ -3735,5 +3759,12 @@ try {
   }
 } catch (err) {
   console.error("Stage capture failed to initialize:", err);
+}
+try {
+  if (window.PerlinBooth && typeof window.PerlinBooth.init === "function") {
+    window.PerlinBooth.init(window.PerlinStageHost);
+  }
+} catch (err) {
+  console.error("Booth failed to initialize:", err);
 }
 requestAnimationFrame(tick);
